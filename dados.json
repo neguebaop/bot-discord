@@ -1,0 +1,11 @@
+{
+    "filas": {
+        "1v1": {
+            "valor": 50,
+            "max": 100,
+            "jogadores": []
+        }
+    },
+    "usuarios_em_fila": {},
+    "total_arrecadado": 0
+}
