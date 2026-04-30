@@ -1245,4 +1245,3 @@ def keep_alive():
 keep_alive()
 
 bot.run(TOKEN)
-bot.run(TOKEN)
