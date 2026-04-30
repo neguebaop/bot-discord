@@ -1235,9 +1235,14 @@ app = Flask(__name__)
 def home():
     return "Bot online!"
 
-def run_web():
+def run():
     app.run(host="0.0.0.0", port=10000)
 
-Thread(target=run_web).start()
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
 
+keep_alive()
+
+bot.run(TOKEN)
 bot.run(TOKEN)
