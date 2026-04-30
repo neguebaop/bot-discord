@@ -5,6 +5,8 @@ import json
 import os
 import asyncio
 import random
+from flask import Flask
+from threading import Thread
 
 import os
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -1224,5 +1226,19 @@ async def painel(ctx):
 
 if not TOKEN:
     raise ValueError("Defina a variável de ambiente DISCORD_TOKEN antes de rodar o bot.")
+
+from flask import Flask
+from threading import Thread
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Bot online!"
+
+def run_web():
+    app.run(host="0.0.0.0", port=10000)
+
+Thread(target=run_web).start()
 
 bot.run(TOKEN)
