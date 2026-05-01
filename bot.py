@@ -1260,7 +1260,6 @@ async def encerrar_fila(interaction: discord.Interaction, nome: str = None):
     nome_escolhido = None
 
     if nome:
-        # tenta achar exato primeiro, depois ignora maiúsculas/minúsculas
         if nome in filas:
             nome_escolhido = nome
         else:
@@ -1269,8 +1268,14 @@ async def encerrar_fila(interaction: discord.Interaction, nome: str = None):
                     nome_escolhido = fila_nome
                     break
     else:
-        # se só existir uma fila salva, encerra ela automaticamente
-        if len(filas) == 1:
+        canal_atual = interaction.channel
+        topico = getattr(canal_atual, "topic", "") or ""
+        if topico.startswith("FILA:"):
+            candidato = topico.replace("FILA:", "", 1).strip()
+            if candidato in filas:
+                nome_escolhido = candidato
+
+        if not nome_escolhido and len(filas) == 1:
             nome_escolhido = next(iter(filas.keys()))
 
     if not nome_escolhido:
@@ -1285,23 +1290,48 @@ async def encerrar_fila(interaction: discord.Interaction, nome: str = None):
     del dados["filas"][nome_escolhido]
     salvar(dados)
 
-    # Tenta apagar mensagens antigas da fila no canal atual, para não sobrar painel morto.
-    apagadas = 0
+    mensagens_apagadas = 0
+    canais_para_deletar = []
+
     try:
-        async for msg in interaction.channel.history(limit=50):
+        async for msg in interaction.channel.history(limit=100):
             if msg.author == bot.user and msg.embeds:
                 titulo = msg.embeds[0].title or ""
-                if nome_escolhido.lower() in titulo.lower() or titulo.lower().startswith(nome_escolhido.lower().split(" - r$")[0]):
+                titulo_lower = titulo.lower()
+                nome_lower = nome_escolhido.lower()
+                formato_lower = nome_escolhido.lower().split(" - r$")[0]
+                if nome_lower in titulo_lower or titulo_lower.startswith(formato_lower):
                     await msg.delete()
-                    apagadas += 1
+                    mensagens_apagadas += 1
     except Exception as e:
-        print(f"Aviso: não consegui apagar mensagens antigas da fila: {e}")
+        print(f"Aviso: não consegui apagar mensagens antigas da fila no canal atual: {e}")
+
+    try:
+        for canal in interaction.guild.text_channels:
+            topico = getattr(canal, "topic", "") or ""
+            if topico.strip() == f"FILA:{nome_escolhido}":
+                canais_para_deletar.append(canal)
+    except Exception as e:
+        print(f"Aviso: erro ao procurar canais privados da fila: {e}")
 
     await interaction.followup.send(
         f"✅ Fila encerrada com sucesso: **{nome_escolhido}**\n"
-        f"🗑️ Mensagens apagadas neste canal: {apagadas}",
+        f"🗑️ Mensagens apagadas neste canal: {mensagens_apagadas}\n"
+        f"📁 Salas privadas encontradas para deletar: {len(canais_para_deletar)}",
         ephemeral=True
     )
+
+    await asyncio.sleep(2)
+
+    canais_deletados = 0
+    for canal in canais_para_deletar:
+        try:
+            await canal.delete(reason=f"Fila encerrada por {interaction.user}")
+            canais_deletados += 1
+        except Exception as e:
+            print(f"Aviso: não consegui deletar canal {getattr(canal, 'name', canal)}: {e}")
+
+    print(f"Fila encerrada: {nome_escolhido} | mensagens={mensagens_apagadas} | canais_deletados={canais_deletados}")
 
 
 @encerrar_fila.error
