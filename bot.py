@@ -213,20 +213,18 @@ def registrar_views_persistentes():
 def tipo_fila(nome: str) -> str:
     nome_lower = nome.lower()
 
-    if "2v2" in nome_lower and "misto" in nome_lower:
+    # 1v1 / 1x1, inclusive Mobile e Emulador: Gel Normal + Gel Infinito + Sair
+    if "1v1" in nome_lower or "1x1" in nome_lower:
+        return "1v1_gel"
+
+    if ("2v2" in nome_lower or "2x2" in nome_lower) and "misto" in nome_lower:
         return "2v2_misto"
 
-    if "3v3" in nome_lower and "misto" in nome_lower:
+    if ("3v3" in nome_lower or "3x3" in nome_lower) and "misto" in nome_lower:
         return "3v3_misto"
 
-    if "4v4" in nome_lower and "misto" in nome_lower:
+    if ("4v4" in nome_lower or "4x4" in nome_lower) and "misto" in nome_lower:
         return "4v4_misto"
-
-    if "1v1" in nome_lower and ("emulador" in nome_lower or "emu" in nome_lower or "mobile" in nome_lower):
-        return "1v1_1emu"
-
-    if "1v1" in nome_lower:
-        return "1v1_gel"
 
     return "normal"
 
@@ -237,7 +235,7 @@ def texto_modo(nome: str, modo: int) -> str:
     if tipo == "1v1_gel":
         return "Gel Normal" if modo == 1 else "Gel Infinito"
 
-    if tipo in ("1v1_1emu", "2v2_misto", "3v3_misto", "4v4_misto"):
+    if tipo in ("2v2_misto", "3v3_misto", "4v4_misto"):
         return f"{modo} Emulador(es)"
 
     return ""
@@ -250,13 +248,8 @@ class FilaView(discord.ui.View):
 
         tipo = tipo_fila(nome)
 
-        # 1v1 Emulador / 1v1 Mobile: apenas 1 Emu + Sair
-        if tipo == "1v1_1emu":
-            self.add_item(Emu1(nome))
-            self.add_item(Sair(nome))
-
-        # 1v1 padrão/gel: Gel Normal + Gel Infinito + Sair
-        elif tipo == "1v1_gel":
+        # 1v1 / 1x1, inclusive Mobile e Emulador: Gel Normal + Gel Infinito + Sair
+        if tipo == "1v1_gel":
             self.add_item(GelNormal(nome))
             self.add_item(GelInfinito(nome))
             self.add_item(Sair(nome))
@@ -905,7 +898,7 @@ async def entrar_fila(interaction, nome, emuladores=1):
 
     if tipo == "1v1_gel":
         mensagem = "✅ Você entrou na fila Gel Normal." if emuladores == 1 else "✅ Você entrou na fila Gel Infinito."
-    elif tipo in ("1v1_1emu", "2v2_misto", "3v3_misto", "4v4_misto"):
+    elif tipo in ("2v2_misto", "3v3_misto", "4v4_misto"):
         mensagem = f"✅ Você entrou na fila {emuladores} Emulador(es)."
     else:
         mensagem = "✅ Você entrou na fila."
