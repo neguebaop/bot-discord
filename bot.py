@@ -2,19 +2,35 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import json
-import os
 import asyncio
 import random
+import hashlib
 from flask import Flask
 from threading import Thread
-from supabase import create_client
 
+try:
+    from supabase import create_client
+except Exception:
+    create_client = None
+
+import os
 TOKEN = os.getenv("DISCORD_TOKEN")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
 GUILD_ID = 1347336329280753785
 ARQUIVO = "filas.json"
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_TABLE = "filas"
+
+supabase = None
+if SUPABASE_URL and SUPABASE_KEY and create_client is not None:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("Supabase conectado com sucesso.")
+    except Exception as e:
+        print(f"Aviso: não foi possível conectar no Supabase: {e}")
+        supabase = None
+
 
 IMAGEM_URL = "https://cdn.discordapp.com/attachments/1192768001364201524/1472035211351953408/orglink.jpg?ex=69911b1f&is=698fc99f&hm=cf22b26862eb8a2a59ffcc7e2e22c31e8ad9854143bca65cc56de51e285ca830"
 
@@ -35,69 +51,73 @@ def dados_padrao():
     }
 
 
-# =========================
-# BANCO DE DADOS / SUPABASE
-# =========================
-
-supabase = None
-if SUPABASE_URL and SUPABASE_KEY:
-    try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("Supabase conectado com sucesso.")
-    except Exception as e:
-        print(f"Erro ao conectar no Supabase: {e}")
-        supabase = None
-else:
-    print("SUPABASE_URL/SUPABASE_KEY não configurados. Usando JSON local.")
-
-
-def salvar(dados):
-    if supabase:
-        supabase.table("filas").upsert({
-            "id": 1,
-            "user_id": "bot",
-            "fila_nome": "principal",
-            "dados": dados
-        }).execute()
-        return
-
+def _salvar_local(dados):
     with open(ARQUIVO, "w", encoding="utf-8") as f:
         json.dump(dados, f, indent=4, ensure_ascii=False)
 
 
-def carregar():
-    if supabase:
-        try:
-            resposta = supabase.table("filas").select("dados").eq("id", 1).execute()
-            if resposta.data and len(resposta.data) > 0:
-                dados = resposta.data[0].get("dados") or dados_padrao()
-            else:
-                dados = dados_padrao()
-                salvar(dados)
-
-            padrao = dados_padrao()
-            for chave, valor in padrao.items():
-                if chave not in dados:
-                    dados[chave] = valor
-            return dados
-        except Exception as e:
-            print(f"Erro ao carregar do Supabase: {e}")
-
+def _carregar_local():
     if not os.path.exists(ARQUIVO):
         dados = dados_padrao()
-        salvar(dados)
+        _salvar_local(dados)
         return dados
 
     with open(ARQUIVO, "r", encoding="utf-8") as f:
-        dados = json.load(f)
+        return json.load(f)
+
+
+def _corrigir_dados(dados):
+    if not isinstance(dados, dict):
+        dados = dados_padrao()
 
     padrao = dados_padrao()
     for chave, valor in padrao.items():
         if chave not in dados:
             dados[chave] = valor
-
     return dados
 
+
+def salvar(dados):
+    dados = _corrigir_dados(dados)
+
+    if supabase is None:
+        _salvar_local(dados)
+        return
+
+    try:
+        supabase.table(SUPABASE_TABLE).upsert({
+            "id": 1,
+            "user_id": "bot",
+            "fila_nome": "principal",
+            "dados": dados
+        }).execute()
+    except Exception as e:
+        print(f"Erro ao salvar no Supabase, salvando localmente: {e}")
+        _salvar_local(dados)
+
+
+def carregar():
+    if supabase is None:
+        return _corrigir_dados(_carregar_local())
+
+    try:
+        resposta = supabase.table(SUPABASE_TABLE).select("dados").eq("id", 1).execute()
+
+        if resposta.data and len(resposta.data) > 0:
+            return _corrigir_dados(resposta.data[0].get("dados", {}))
+
+        # Primeira vez usando Supabase: tenta migrar o filas.json local.
+        if os.path.exists(ARQUIVO):
+            dados = _corrigir_dados(_carregar_local())
+        else:
+            dados = dados_padrao()
+
+        salvar(dados)
+        return dados
+
+    except Exception as e:
+        print(f"Erro ao carregar do Supabase, usando arquivo local: {e}")
+        return _corrigir_dados(_carregar_local())
 
 def is_mediador(interaction: discord.Interaction):
     return (
@@ -134,47 +154,123 @@ tree = bot.tree
 
 @bot.event
 async def on_ready():
-    if not getattr(bot, "views_registradas", False):
-        dados = carregar()
-        for nome, fila in dados.get("filas", {}).items():
-            if "streamer" in fila:
-                bot.add_view(FilaStreamerView(nome))
-            else:
-                bot.add_view(FilaView(nome))
-        bot.views_registradas = True
-        print(f"Views persistentes registradas: {len(dados.get('filas', {}))}")
+    if not getattr(bot, "views_persistentes_registradas", False):
+        registrar_views_persistentes()
+        bot.views_persistentes_registradas = True
 
     print(f"Bot online como {bot.user}")
 
 
 # =========================
+# BOTÕES PERSISTENTES
+# =========================
+
+def make_custom_id(prefix, nome):
+    """Gera um custom_id fixo e curto para os botões continuarem funcionando após deploy/restart."""
+    nome_hash = hashlib.sha256(nome.encode("utf-8")).hexdigest()[:24]
+    return f"{prefix}:{nome_hash}"
+
+
+def registrar_views_persistentes():
+    """Reconecta os botões das mensagens antigas usando as filas salvas no Supabase/JSON."""
+    dados = carregar()
+    total = 0
+
+    for nome, fila in dados.get("filas", {}).items():
+        try:
+            if "streamer" in fila:
+                bot.add_view(FilaStreamerView(nome))
+            else:
+                bot.add_view(FilaView(nome))
+            total += 1
+        except Exception as e:
+            print(f"Aviso: não foi possível registrar view da fila {nome}: {e}")
+
+    try:
+        bot.add_view(BlacklistView())
+    except Exception:
+        pass
+
+    try:
+        bot.add_view(PerfilView())
+    except Exception:
+        pass
+
+    try:
+        bot.add_view(LojaView())
+    except Exception:
+        pass
+
+    print(f"Views persistentes registradas: {total}")
+
+# =========================
 # VIEW FILA
 # =========================
+
+def tipo_fila(nome: str) -> str:
+    nome_lower = nome.lower()
+
+    if "2v2" in nome_lower and "misto" in nome_lower:
+        return "2v2_misto"
+
+    if "3v3" in nome_lower and "misto" in nome_lower:
+        return "3v3_misto"
+
+    if "4v4" in nome_lower and "misto" in nome_lower:
+        return "4v4_misto"
+
+    if "1v1" in nome_lower and ("emulador" in nome_lower or "emu" in nome_lower or "mobile" in nome_lower):
+        return "1v1_1emu"
+
+    if "1v1" in nome_lower:
+        return "1v1_gel"
+
+    return "normal"
+
+
+def texto_modo(nome: str, modo: int) -> str:
+    tipo = tipo_fila(nome)
+
+    if tipo == "1v1_gel":
+        return "Gel Normal" if modo == 1 else "Gel Infinito"
+
+    if tipo in ("1v1_1emu", "2v2_misto", "3v3_misto", "4v4_misto"):
+        return f"{modo} Emulador(es)"
+
+    return ""
+
 
 class FilaView(discord.ui.View):
     def __init__(self, nome):
         super().__init__(timeout=None)
         self.nome = nome
 
-        nome_lower = nome.lower()
+        tipo = tipo_fila(nome)
 
-        if "1v1" in nome_lower:
+        # 1v1 Emulador / 1v1 Mobile: apenas 1 Emu + Sair
+        if tipo == "1v1_1emu":
+            self.add_item(Emu1(nome))
+            self.add_item(Sair(nome))
+
+        # 1v1 padrão/gel: Gel Normal + Gel Infinito + Sair
+        elif tipo == "1v1_gel":
             self.add_item(GelNormal(nome))
             self.add_item(GelInfinito(nome))
             self.add_item(Sair(nome))
 
-        elif "2v2" in nome_lower and "misto" in nome_lower:
+        # 2v2 Misto: apenas 1 Emu + Sair
+        elif tipo == "2v2_misto":
+            self.add_item(Emu1(nome))
+            self.add_item(Sair(nome))
+
+        # 3v3 Misto: 1 Emu + 2 Emu + Sair
+        elif tipo == "3v3_misto":
             self.add_item(Emu1(nome))
             self.add_item(Emu2(nome))
             self.add_item(Sair(nome))
 
-        elif "3v3" in nome_lower and "misto" in nome_lower:
-            self.add_item(Emu1(nome))
-            self.add_item(Emu2(nome))
-            self.add_item(Emu3(nome))
-            self.add_item(Sair(nome))
-
-        elif "4v4" in nome_lower and "misto" in nome_lower:
+        # 4v4 Misto: 1 Emu + 2 Emu + 3 Emu + Sair
+        elif tipo == "4v4_misto":
             self.add_item(Emu1(nome))
             self.add_item(Emu2(nome))
             self.add_item(Emu3(nome))
@@ -195,7 +291,11 @@ class FilaStreamerView(discord.ui.View):
 
 class EntrarStreamer(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(label="✅ Entrar na Fila", style=discord.ButtonStyle.success, custom_id=f"entrar_streamer:{nome}")
+        super().__init__(
+            label="✅ Entrar na Fila",
+            style=discord.ButtonStyle.success,
+            custom_id=make_custom_id("entrar_streamer", nome)
+        )
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -241,7 +341,11 @@ class EntrarStreamer(discord.ui.Button):
 
 class SairStreamer(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(label="❌ Sair da Fila", style=discord.ButtonStyle.danger, custom_id=f"sair_streamer:{nome}")
+        super().__init__(
+            label="❌ Sair da Fila",
+            style=discord.ButtonStyle.danger,
+            custom_id=make_custom_id("sair_streamer", nome)
+        )
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -265,7 +369,11 @@ class SairStreamer(discord.ui.Button):
 
 class Entrar(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(label="Entrar na fila", style=discord.ButtonStyle.success, custom_id=f"entrar:{nome}")
+        super().__init__(
+            label="Entrar na fila",
+            style=discord.ButtonStyle.success,
+            custom_id=make_custom_id("entrar", nome)
+        )
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -274,7 +382,11 @@ class Entrar(discord.ui.Button):
 
 class GelNormal(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(label="🧊 Gel Normal", style=discord.ButtonStyle.primary, custom_id=f"gel_normal:{nome}")
+        super().__init__(
+            label="🧊 Gel Normal",
+            style=discord.ButtonStyle.primary,
+            custom_id=make_custom_id("gel_normal", nome)
+        )
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -283,7 +395,11 @@ class GelNormal(discord.ui.Button):
 
 class GelInfinito(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(label="🧊 Gel Infinito", style=discord.ButtonStyle.secondary, custom_id=f"gel_infinito:{nome}")
+        super().__init__(
+            label="🧊 Gel Infinito",
+            style=discord.ButtonStyle.secondary,
+            custom_id=make_custom_id("gel_infinito", nome)
+        )
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -292,7 +408,11 @@ class GelInfinito(discord.ui.Button):
 
 class Emu1(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(label="💻 1 Emu", style=discord.ButtonStyle.primary, custom_id=f"emu1:{nome}")
+        super().__init__(
+            label="💻 1 Emu",
+            style=discord.ButtonStyle.primary,
+            custom_id=make_custom_id("emu1", nome)
+        )
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -301,7 +421,11 @@ class Emu1(discord.ui.Button):
 
 class Emu2(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(label="💻 2 Emu", style=discord.ButtonStyle.secondary, custom_id=f"emu2:{nome}")
+        super().__init__(
+            label="💻 2 Emu",
+            style=discord.ButtonStyle.secondary,
+            custom_id=make_custom_id("emu2", nome)
+        )
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -310,7 +434,11 @@ class Emu2(discord.ui.Button):
 
 class Emu3(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(label="💻 3 Emu", style=discord.ButtonStyle.success, custom_id=f"emu3:{nome}")
+        super().__init__(
+            label="💻 3 Emu",
+            style=discord.ButtonStyle.success,
+            custom_id=make_custom_id("emu3", nome)
+        )
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -319,7 +447,11 @@ class Emu3(discord.ui.Button):
 
 class Sair(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(label="❌ Sair da fila", style=discord.ButtonStyle.danger, custom_id=f"sair:{nome}")
+        super().__init__(
+            label="❌ Sair da fila",
+            style=discord.ButtonStyle.danger,
+            custom_id=make_custom_id("sair", nome)
+        )
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -355,7 +487,11 @@ class BlacklistView(discord.ui.View):
 
 class VerificarButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="🔍 Verificar ID", style=discord.ButtonStyle.primary)
+        super().__init__(
+            label="🔍 Verificar ID",
+            style=discord.ButtonStyle.primary,
+            custom_id="blacklist:verificar"
+        )
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(VerificarModal())
@@ -402,7 +538,8 @@ class LojaButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
             label="Clique aqui para comprar algum item da loja...",
-            style=discord.ButtonStyle.green
+            style=discord.ButtonStyle.green,
+            custom_id="loja:abrir"
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -739,11 +876,11 @@ async def entrar_fila(interaction, nome, emuladores=1):
 
     salvar(dados)
 
-    nome_lower = nome.lower()
+    tipo = tipo_fila(nome)
 
-    if "1v1" in nome_lower:
+    if tipo == "1v1_gel":
         mensagem = "✅ Você entrou na fila Gel Normal." if emuladores == 1 else "✅ Você entrou na fila Gel Infinito."
-    elif "misto" in nome_lower:
+    elif tipo in ("1v1_1emu", "2v2_misto", "3v3_misto", "4v4_misto"):
         mensagem = f"✅ Você entrou na fila {emuladores} Emulador(es)."
     else:
         mensagem = "✅ Você entrou na fila."
@@ -825,19 +962,16 @@ async def atualizar_embed(interaction, nome):
     if "modo" not in fila:
         fila["modo"] = {}
 
-    nome_lower = nome.lower()
-
     for user_id in fila["jogadores"]:
         membro = interaction.guild.get_member(user_id)
         if not membro:
             continue
 
         modo = fila["modo"].get(str(user_id), 1)
+        modo_txt = texto_modo(nome, modo)
 
-        if "1v1" in nome_lower:
-            jogadores_texto += f"{membro.mention} | {'Gel Normal' if modo == 1 else 'Gel Infinito'}\n"
-        elif "misto" in nome_lower:
-            jogadores_texto += f"{membro.mention} | {modo} Emulador(es)\n"
+        if modo_txt:
+            jogadores_texto += f"{membro.mention} | {modo_txt}\n"
         else:
             jogadores_texto += f"{membro.mention}\n"
 
@@ -984,6 +1118,9 @@ async def criar_fila_streamer(
     valor: float,
     regras: str
 ):
+    # Evita "O aplicativo não respondeu" quando Supabase/Discord demora.
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
     dados = carregar()
     nome_fila = f"JOGUE CONTRA {streamer.display_name}"
 
@@ -1011,19 +1148,36 @@ async def criar_fila_streamer(
     embed.add_field(name="👥 Jogadores", value="Nenhum aguardando.", inline=False)
     embed.set_thumbnail(url=streamer.display_avatar.url)
 
-    await interaction.response.send_message("Fila streamer criada com sucesso.", ephemeral=True)
+    await interaction.followup.send("Fila streamer criada com sucesso.", ephemeral=True)
     await interaction.channel.send(embed=embed, view=FilaStreamerView(nome_fila))
+
+
+@criar_fila_streamer.error
+async def criar_fila_streamer_error(interaction: discord.Interaction, error):
+    if interaction.response.is_done():
+        send = interaction.followup.send
+    else:
+        send = interaction.response.send_message
+
+    if isinstance(error, app_commands.CheckFailure):
+        await send("❌ Você precisa ser administrador para criar fila de streamer.", ephemeral=True)
+    else:
+        await send(f"❌ Erro ao criar fila de streamer: {error}", ephemeral=True)
+        print(f"Erro no /criar_fila_streamer: {error}")
 
 
 @tree.command(name="criar_fila", description="Criar nova fila")
 @app_commands.check(is_admin)
 async def criar_fila(interaction: discord.Interaction, nome: str, valor: float, max_jogadores: int):
+    # Evita "O aplicativo não respondeu" quando Supabase/Discord demora.
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
     dados = carregar()
 
     nome_completo = f"{nome} - R${valor:.2f}"
 
     if nome_completo in dados["filas"]:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "Já existe uma fila com esse formato e valor.",
             ephemeral=True
         )
@@ -1046,8 +1200,22 @@ async def criar_fila(interaction: discord.Interaction, nome: str, valor: float, 
     embed.add_field(name="🛡️ Mediador", value="Será definido na partida", inline=False)
     embed.set_thumbnail(url=IMAGEM_URL)
 
-    await interaction.response.send_message("Fila criada com sucesso.", ephemeral=True)
+    await interaction.followup.send("Fila criada com sucesso.", ephemeral=True)
     await interaction.channel.send(embed=embed, view=FilaView(nome_completo))
+
+
+@criar_fila.error
+async def criar_fila_error(interaction: discord.Interaction, error):
+    if interaction.response.is_done():
+        send = interaction.followup.send
+    else:
+        send = interaction.response.send_message
+
+    if isinstance(error, app_commands.CheckFailure):
+        await send("❌ Você precisa ser administrador para criar fila.", ephemeral=True)
+    else:
+        await send(f"❌ Erro ao criar fila: {error}", ephemeral=True)
+        print(f"Erro no /criar_fila: {error}")
 
 
 @tree.command(name="resetar_filas", description="Resetar tudo")
@@ -1056,28 +1224,6 @@ async def resetar_filas(interaction: discord.Interaction):
     dados = dados_padrao()
     salvar(dados)
     await interaction.response.send_message("Todas as filas, coins, ranking, derrotas e loja foram resetadas.")
-
-
-@tree.command(name="deletar_fila", description="Deletar uma fila específica pelo nome completo")
-@app_commands.check(is_admin)
-async def deletar_fila(interaction: discord.Interaction, nome_fila: str):
-    dados = carregar()
-
-    if nome_fila not in dados["filas"]:
-        filas = "\n".join(dados["filas"].keys()) or "Nenhuma fila salva."
-        await interaction.response.send_message(
-            f"❌ Fila não encontrada.\n\nFilas salvas:\n```{filas}```",
-            ephemeral=True
-        )
-        return
-
-    del dados["filas"][nome_fila]
-    salvar(dados)
-
-    await interaction.response.send_message(
-        f"✅ Fila **{nome_fila}** deletada do banco.",
-        ephemeral=True
-    )
 
 
 @tree.command(name="resetar_coins", description="Zerar as LinCoins de todos os jogadores")
@@ -1304,21 +1450,18 @@ async def painel(ctx):
 if not TOKEN:
     raise ValueError("Defina a variável de ambiente DISCORD_TOKEN antes de rodar o bot.")
 
-# =========================
-# KEEP ALIVE PARA RENDER
-# =========================
-
 app = Flask(__name__)
 
 @app.route("/")
 def home():
     return "Bot online!"
 
-def run_web():
+def run():
     app.run(host="0.0.0.0", port=10000)
 
 def keep_alive():
-    Thread(target=run_web, daemon=True).start()
+    t = Thread(target=run)
+    t.start()
 
 keep_alive()
 
