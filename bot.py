@@ -1236,6 +1236,88 @@ async def criar_fila_error(interaction: discord.Interaction, error):
         print(f"Erro no /criar_fila: {error}")
 
 
+async def autocomplete_filas(interaction: discord.Interaction, current: str):
+    dados = carregar()
+    nomes = list(dados.get("filas", {}).keys())
+    current_lower = (current or "").lower()
+    filtradas = [n for n in nomes if current_lower in n.lower()]
+    return [app_commands.Choice(name=n[:100], value=n) for n in filtradas[:25]]
+
+
+@tree.command(name="encerrar_fila", description="Encerrar/remover uma fila salva")
+@app_commands.check(is_admin)
+@app_commands.autocomplete(nome=autocomplete_filas)
+async def encerrar_fila(interaction: discord.Interaction, nome: str = None):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    dados = carregar()
+    filas = dados.get("filas", {})
+
+    if not filas:
+        await interaction.followup.send("❌ Não existe nenhuma fila salva para encerrar.", ephemeral=True)
+        return
+
+    nome_escolhido = None
+
+    if nome:
+        # tenta achar exato primeiro, depois ignora maiúsculas/minúsculas
+        if nome in filas:
+            nome_escolhido = nome
+        else:
+            for fila_nome in filas.keys():
+                if fila_nome.lower() == nome.lower():
+                    nome_escolhido = fila_nome
+                    break
+    else:
+        # se só existir uma fila salva, encerra ela automaticamente
+        if len(filas) == 1:
+            nome_escolhido = next(iter(filas.keys()))
+
+    if not nome_escolhido:
+        lista = "\n".join([f"• `{n}`" for n in list(filas.keys())[:15]])
+        await interaction.followup.send(
+            "❌ Informe o nome da fila para encerrar.\n\n"
+            "Filas salvas:\n" + (lista or "Nenhuma."),
+            ephemeral=True
+        )
+        return
+
+    del dados["filas"][nome_escolhido]
+    salvar(dados)
+
+    # Tenta apagar mensagens antigas da fila no canal atual, para não sobrar painel morto.
+    apagadas = 0
+    try:
+        async for msg in interaction.channel.history(limit=50):
+            if msg.author == bot.user and msg.embeds:
+                titulo = msg.embeds[0].title or ""
+                if nome_escolhido.lower() in titulo.lower() or titulo.lower().startswith(nome_escolhido.lower().split(" - r$")[0]):
+                    await msg.delete()
+                    apagadas += 1
+    except Exception as e:
+        print(f"Aviso: não consegui apagar mensagens antigas da fila: {e}")
+
+    await interaction.followup.send(
+        f"✅ Fila encerrada com sucesso: **{nome_escolhido}**\n"
+        f"🗑️ Mensagens apagadas neste canal: {apagadas}",
+        ephemeral=True
+    )
+
+
+@encerrar_fila.error
+async def encerrar_fila_error(interaction: discord.Interaction, error):
+    if interaction.response.is_done():
+        send = interaction.followup.send
+    else:
+        send = interaction.response.send_message
+
+    if isinstance(error, app_commands.CheckFailure):
+        await send("❌ Você precisa ser administrador para encerrar fila.", ephemeral=True)
+    else:
+        await send(f"❌ Erro ao encerrar fila: {error}", ephemeral=True)
+        print(f"Erro no /encerrar_fila: {error}")
+
+
 @tree.command(name="resetar_filas", description="Resetar tudo")
 @app_commands.check(is_admin)
 async def resetar_filas(interaction: discord.Interaction):
