@@ -7,10 +7,29 @@ import random
 from flask import Flask
 from threading import Thread
 
+try:
+    from supabase import create_client
+except Exception:
+    create_client = None
+
 import os
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = 1347336329280753785
 ARQUIVO = "filas.json"
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_TABLE = "filas"
+
+supabase = None
+if SUPABASE_URL and SUPABASE_KEY and create_client is not None:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("Supabase conectado com sucesso.")
+    except Exception as e:
+        print(f"Aviso: não foi possível conectar no Supabase: {e}")
+        supabase = None
+
 
 IMAGEM_URL = "https://cdn.discordapp.com/attachments/1192768001364201524/1472035211351953408/orglink.jpg?ex=69911b1f&is=698fc99f&hm=cf22b26862eb8a2a59ffcc7e2e22c31e8ad9854143bca65cc56de51e285ca830"
 
@@ -31,27 +50,73 @@ def dados_padrao():
     }
 
 
-def salvar(dados):
+def _salvar_local(dados):
     with open(ARQUIVO, "w", encoding="utf-8") as f:
         json.dump(dados, f, indent=4, ensure_ascii=False)
 
 
-def carregar():
+def _carregar_local():
     if not os.path.exists(ARQUIVO):
         dados = dados_padrao()
-        salvar(dados)
+        _salvar_local(dados)
         return dados
 
     with open(ARQUIVO, "r", encoding="utf-8") as f:
-        dados = json.load(f)
+        return json.load(f)
+
+
+def _corrigir_dados(dados):
+    if not isinstance(dados, dict):
+        dados = dados_padrao()
 
     padrao = dados_padrao()
     for chave, valor in padrao.items():
         if chave not in dados:
             dados[chave] = valor
-
     return dados
 
+
+def salvar(dados):
+    dados = _corrigir_dados(dados)
+
+    if supabase is None:
+        _salvar_local(dados)
+        return
+
+    try:
+        supabase.table(SUPABASE_TABLE).upsert({
+            "id": 1,
+            "user_id": "bot",
+            "fila_nome": "principal",
+            "dados": dados
+        }).execute()
+    except Exception as e:
+        print(f"Erro ao salvar no Supabase, salvando localmente: {e}")
+        _salvar_local(dados)
+
+
+def carregar():
+    if supabase is None:
+        return _corrigir_dados(_carregar_local())
+
+    try:
+        resposta = supabase.table(SUPABASE_TABLE).select("dados").eq("id", 1).execute()
+
+        if resposta.data and len(resposta.data) > 0:
+            return _corrigir_dados(resposta.data[0].get("dados", {}))
+
+        # Primeira vez usando Supabase: tenta migrar o filas.json local.
+        if os.path.exists(ARQUIVO):
+            dados = _corrigir_dados(_carregar_local())
+        else:
+            dados = dados_padrao()
+
+        salvar(dados)
+        return dados
+
+    except Exception as e:
+        print(f"Erro ao carregar do Supabase, usando arquivo local: {e}")
+        return _corrigir_dados(_carregar_local())
 
 def is_mediador(interaction: discord.Interaction):
     return (
@@ -1225,9 +1290,6 @@ async def painel(ctx):
 
 if not TOKEN:
     raise ValueError("Defina a variável de ambiente DISCORD_TOKEN antes de rodar o bot.")
-
-from flask import Flask
-from threading import Thread
 
 app = Flask(__name__)
 
