@@ -241,6 +241,54 @@ def texto_modo(nome: str, modo: int) -> str:
     return ""
 
 
+def extrair_valor_fila(nome: str) -> float:
+    """Tenta recuperar o valor da fila pelo nome salvo na mensagem.
+    Ex: '1v1 mobile - R$100.00' -> 100.0
+    Isso evita que uma fila antiga fique inutilizável se ela sumir do Supabase por reset/bug anterior.
+    """
+    try:
+        if "R$" in nome:
+            parte = nome.split("R$", 1)[1].strip().split()[0]
+            if "," in parte:
+                parte = parte.replace(".", "").replace(",", ".")
+            return float(parte)
+    except Exception:
+        pass
+    return 0.0
+
+
+def garantir_fila_salva(dados: dict, nome: str) -> dict:
+    """Garante que a fila exista no banco.
+
+    Se a mensagem da fila ainda existe no Discord, mas o registro sumiu do Supabase
+    por algum reset/deploy/versão anterior do /encerrar_fila, o bot recria a fila
+    automaticamente em vez de responder 'Fila não encontrada'.
+    """
+    if "filas" not in dados or not isinstance(dados["filas"], dict):
+        dados["filas"] = {}
+
+    if nome not in dados["filas"]:
+        dados["filas"][nome] = {
+            "valor": extrair_valor_fila(nome),
+            "max": 50,
+            "jogadores": [],
+            "modo": {}
+        }
+        salvar(dados)
+        print(f"Fila recriada automaticamente no banco: {nome}")
+
+    fila = dados["filas"][nome]
+    if "jogadores" not in fila or not isinstance(fila["jogadores"], list):
+        fila["jogadores"] = []
+    if "modo" not in fila or not isinstance(fila["modo"], dict):
+        fila["modo"] = {}
+    if "valor" not in fila:
+        fila["valor"] = extrair_valor_fila(nome)
+    if "max" not in fila:
+        fila["max"] = 50
+    return fila
+
+
 class FilaView(discord.ui.View):
     def __init__(self, nome):
         super().__init__(timeout=None)
@@ -452,11 +500,8 @@ class Sair(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
         dados = carregar()
-        if self.nome not in dados["filas"]:
-            await interaction.response.send_message("Fila não encontrada.", ephemeral=True)
-            return
-
-        fila = dados["filas"][self.nome]
+        # Não deixa mensagem antiga morrer se o registro sumiu do banco.
+        fila = garantir_fila_salva(dados, self.nome)
 
         if interaction.user.id not in fila["jogadores"]:
             await interaction.response.send_message("Você não está nessa fila.", ephemeral=True)
@@ -482,7 +527,7 @@ class FilaCompatAntigaView(discord.ui.View):
         super().__init__(timeout=None)
         tipo = tipo_fila(nome)
 
-        if tipo == "1v1_1emu":
+        if tipo == "1v1_gel":
             self.add_item(Entrar(nome))
 
         elif tipo == "2v2_misto":
@@ -875,14 +920,9 @@ async def entrar_fila(interaction, nome, emuladores=1):
     dados = carregar()
     user = interaction.user
 
-    if nome not in dados["filas"]:
-        await interaction.response.send_message("Fila não encontrada.", ephemeral=True)
-        return
-
-    fila = dados["filas"][nome]
-
-    if "modo" not in fila:
-        fila["modo"] = {}
+    # Se a mensagem da fila existe, mas o registro sumiu do Supabase por algum reset/bug antigo,
+    # recria automaticamente em vez de quebrar com "Fila não encontrada".
+    fila = garantir_fila_salva(dados, nome)
 
     if user.id in fila["jogadores"]:
         fila["jogadores"].remove(user.id)
@@ -939,10 +979,7 @@ async def entrar_fila(interaction, nome, emuladores=1):
 async def atualizar_embed(interaction, nome):
     dados = carregar()
 
-    if nome not in dados["filas"]:
-        return
-
-    fila = dados["filas"][nome]
+    fila = garantir_fila_salva(dados, nome)
 
     if "streamer" in fila:
         jogadores_texto = ""
