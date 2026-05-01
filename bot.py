@@ -4,6 +4,7 @@ from discord import app_commands
 import json
 import asyncio
 import random
+import hashlib
 from flask import Flask
 from threading import Thread
 
@@ -153,8 +154,54 @@ tree = bot.tree
 
 @bot.event
 async def on_ready():
+    if not getattr(bot, "views_persistentes_registradas", False):
+        registrar_views_persistentes()
+        bot.views_persistentes_registradas = True
+
     print(f"Bot online como {bot.user}")
 
+
+# =========================
+# BOTÕES PERSISTENTES
+# =========================
+
+def make_custom_id(prefix, nome):
+    """Gera um custom_id fixo e curto para os botões continuarem funcionando após deploy/restart."""
+    nome_hash = hashlib.sha256(nome.encode("utf-8")).hexdigest()[:24]
+    return f"{prefix}:{nome_hash}"
+
+
+def registrar_views_persistentes():
+    """Reconecta os botões das mensagens antigas usando as filas salvas no Supabase/JSON."""
+    dados = carregar()
+    total = 0
+
+    for nome, fila in dados.get("filas", {}).items():
+        try:
+            if "streamer" in fila:
+                bot.add_view(FilaStreamerView(nome))
+            else:
+                bot.add_view(FilaView(nome))
+            total += 1
+        except Exception as e:
+            print(f"Aviso: não foi possível registrar view da fila {nome}: {e}")
+
+    try:
+        bot.add_view(BlacklistView())
+    except Exception:
+        pass
+
+    try:
+        bot.add_view(PerfilView())
+    except Exception:
+        pass
+
+    try:
+        bot.add_view(LojaView())
+    except Exception:
+        pass
+
+    print(f"Views persistentes registradas: {total}")
 
 # =========================
 # VIEW FILA
@@ -204,7 +251,11 @@ class FilaStreamerView(discord.ui.View):
 
 class EntrarStreamer(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(label="✅ Entrar na Fila", style=discord.ButtonStyle.success)
+        super().__init__(
+            label="✅ Entrar na Fila",
+            style=discord.ButtonStyle.success,
+            custom_id=make_custom_id("entrar_streamer", nome)
+        )
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -250,7 +301,11 @@ class EntrarStreamer(discord.ui.Button):
 
 class SairStreamer(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(label="❌ Sair da Fila", style=discord.ButtonStyle.danger)
+        super().__init__(
+            label="❌ Sair da Fila",
+            style=discord.ButtonStyle.danger,
+            custom_id=make_custom_id("sair_streamer", nome)
+        )
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -274,7 +329,11 @@ class SairStreamer(discord.ui.Button):
 
 class Entrar(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(label="Entrar na fila", style=discord.ButtonStyle.success)
+        super().__init__(
+            label="Entrar na fila",
+            style=discord.ButtonStyle.success,
+            custom_id=make_custom_id("entrar", nome)
+        )
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -283,7 +342,11 @@ class Entrar(discord.ui.Button):
 
 class GelNormal(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(label="🧊 Gel Normal", style=discord.ButtonStyle.primary)
+        super().__init__(
+            label="🧊 Gel Normal",
+            style=discord.ButtonStyle.primary,
+            custom_id=make_custom_id("gel_normal", nome)
+        )
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -292,7 +355,11 @@ class GelNormal(discord.ui.Button):
 
 class GelInfinito(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(label="🧊 Gel Infinito", style=discord.ButtonStyle.secondary)
+        super().__init__(
+            label="🧊 Gel Infinito",
+            style=discord.ButtonStyle.secondary,
+            custom_id=make_custom_id("gel_infinito", nome)
+        )
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -301,7 +368,11 @@ class GelInfinito(discord.ui.Button):
 
 class Emu1(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(label="💻 1 Emu", style=discord.ButtonStyle.primary)
+        super().__init__(
+            label="💻 1 Emu",
+            style=discord.ButtonStyle.primary,
+            custom_id=make_custom_id("emu1", nome)
+        )
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -310,7 +381,11 @@ class Emu1(discord.ui.Button):
 
 class Emu2(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(label="💻 2 Emu", style=discord.ButtonStyle.secondary)
+        super().__init__(
+            label="💻 2 Emu",
+            style=discord.ButtonStyle.secondary,
+            custom_id=make_custom_id("emu2", nome)
+        )
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -319,7 +394,11 @@ class Emu2(discord.ui.Button):
 
 class Emu3(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(label="💻 3 Emu", style=discord.ButtonStyle.success)
+        super().__init__(
+            label="💻 3 Emu",
+            style=discord.ButtonStyle.success,
+            custom_id=make_custom_id("emu3", nome)
+        )
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -328,7 +407,11 @@ class Emu3(discord.ui.Button):
 
 class Sair(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(label="❌ Sair da fila", style=discord.ButtonStyle.danger)
+        super().__init__(
+            label="❌ Sair da fila",
+            style=discord.ButtonStyle.danger,
+            custom_id=make_custom_id("sair", nome)
+        )
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -364,7 +447,11 @@ class BlacklistView(discord.ui.View):
 
 class VerificarButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="🔍 Verificar ID", style=discord.ButtonStyle.primary)
+        super().__init__(
+            label="🔍 Verificar ID",
+            style=discord.ButtonStyle.primary,
+            custom_id="blacklist:verificar"
+        )
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(VerificarModal())
@@ -411,7 +498,8 @@ class LojaButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
             label="Clique aqui para comprar algum item da loja...",
-            style=discord.ButtonStyle.green
+            style=discord.ButtonStyle.green,
+            custom_id="loja:abrir"
         )
 
     async def callback(self, interaction: discord.Interaction):
