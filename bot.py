@@ -2,35 +2,19 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import json
+import os
 import asyncio
 import random
-import hashlib
 from flask import Flask
 from threading import Thread
+from supabase import create_client
 
-try:
-    from supabase import create_client
-except Exception:
-    create_client = None
-
-import os
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = 1347336329280753785
-ARQUIVO = "filas.json"
-
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-SUPABASE_TABLE = "filas"
 
-supabase = None
-if SUPABASE_URL and SUPABASE_KEY and create_client is not None:
-    try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("Supabase conectado com sucesso.")
-    except Exception as e:
-        print(f"Aviso: não foi possível conectar no Supabase: {e}")
-        supabase = None
-
+GUILD_ID = 1347336329280753785
+ARQUIVO = "filas.json"
 
 IMAGEM_URL = "https://cdn.discordapp.com/attachments/1192768001364201524/1472035211351953408/orglink.jpg?ex=69911b1f&is=698fc99f&hm=cf22b26862eb8a2a59ffcc7e2e22c31e8ad9854143bca65cc56de51e285ca830"
 
@@ -51,73 +35,69 @@ def dados_padrao():
     }
 
 
-def _salvar_local(dados):
-    with open(ARQUIVO, "w", encoding="utf-8") as f:
-        json.dump(dados, f, indent=4, ensure_ascii=False)
+# =========================
+# BANCO DE DADOS / SUPABASE
+# =========================
 
-
-def _carregar_local():
-    if not os.path.exists(ARQUIVO):
-        dados = dados_padrao()
-        _salvar_local(dados)
-        return dados
-
-    with open(ARQUIVO, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _corrigir_dados(dados):
-    if not isinstance(dados, dict):
-        dados = dados_padrao()
-
-    padrao = dados_padrao()
-    for chave, valor in padrao.items():
-        if chave not in dados:
-            dados[chave] = valor
-    return dados
+supabase = None
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        print("Supabase conectado com sucesso.")
+    except Exception as e:
+        print(f"Erro ao conectar no Supabase: {e}")
+        supabase = None
+else:
+    print("SUPABASE_URL/SUPABASE_KEY não configurados. Usando JSON local.")
 
 
 def salvar(dados):
-    dados = _corrigir_dados(dados)
-
-    if supabase is None:
-        _salvar_local(dados)
-        return
-
-    try:
-        supabase.table(SUPABASE_TABLE).upsert({
+    if supabase:
+        supabase.table("filas").upsert({
             "id": 1,
             "user_id": "bot",
             "fila_nome": "principal",
             "dados": dados
         }).execute()
-    except Exception as e:
-        print(f"Erro ao salvar no Supabase, salvando localmente: {e}")
-        _salvar_local(dados)
+        return
+
+    with open(ARQUIVO, "w", encoding="utf-8") as f:
+        json.dump(dados, f, indent=4, ensure_ascii=False)
 
 
 def carregar():
-    if supabase is None:
-        return _corrigir_dados(_carregar_local())
+    if supabase:
+        try:
+            resposta = supabase.table("filas").select("dados").eq("id", 1).execute()
+            if resposta.data and len(resposta.data) > 0:
+                dados = resposta.data[0].get("dados") or dados_padrao()
+            else:
+                dados = dados_padrao()
+                salvar(dados)
 
-    try:
-        resposta = supabase.table(SUPABASE_TABLE).select("dados").eq("id", 1).execute()
+            padrao = dados_padrao()
+            for chave, valor in padrao.items():
+                if chave not in dados:
+                    dados[chave] = valor
+            return dados
+        except Exception as e:
+            print(f"Erro ao carregar do Supabase: {e}")
 
-        if resposta.data and len(resposta.data) > 0:
-            return _corrigir_dados(resposta.data[0].get("dados", {}))
-
-        # Primeira vez usando Supabase: tenta migrar o filas.json local.
-        if os.path.exists(ARQUIVO):
-            dados = _corrigir_dados(_carregar_local())
-        else:
-            dados = dados_padrao()
-
+    if not os.path.exists(ARQUIVO):
+        dados = dados_padrao()
         salvar(dados)
         return dados
 
-    except Exception as e:
-        print(f"Erro ao carregar do Supabase, usando arquivo local: {e}")
-        return _corrigir_dados(_carregar_local())
+    with open(ARQUIVO, "r", encoding="utf-8") as f:
+        dados = json.load(f)
+
+    padrao = dados_padrao()
+    for chave, valor in padrao.items():
+        if chave not in dados:
+            dados[chave] = valor
+
+    return dados
+
 
 def is_mediador(interaction: discord.Interaction):
     return (
@@ -154,54 +134,18 @@ tree = bot.tree
 
 @bot.event
 async def on_ready():
-    if not getattr(bot, "views_persistentes_registradas", False):
-        registrar_views_persistentes()
-        bot.views_persistentes_registradas = True
-
-    print(f"Bot online como {bot.user}")
-
-
-# =========================
-# BOTÕES PERSISTENTES
-# =========================
-
-def make_custom_id(prefix, nome):
-    """Gera um custom_id fixo e curto para os botões continuarem funcionando após deploy/restart."""
-    nome_hash = hashlib.sha256(nome.encode("utf-8")).hexdigest()[:24]
-    return f"{prefix}:{nome_hash}"
-
-
-def registrar_views_persistentes():
-    """Reconecta os botões das mensagens antigas usando as filas salvas no Supabase/JSON."""
-    dados = carregar()
-    total = 0
-
-    for nome, fila in dados.get("filas", {}).items():
-        try:
+    if not getattr(bot, "views_registradas", False):
+        dados = carregar()
+        for nome, fila in dados.get("filas", {}).items():
             if "streamer" in fila:
                 bot.add_view(FilaStreamerView(nome))
             else:
                 bot.add_view(FilaView(nome))
-            total += 1
-        except Exception as e:
-            print(f"Aviso: não foi possível registrar view da fila {nome}: {e}")
+        bot.views_registradas = True
+        print(f"Views persistentes registradas: {len(dados.get('filas', {}))}")
 
-    try:
-        bot.add_view(BlacklistView())
-    except Exception:
-        pass
+    print(f"Bot online como {bot.user}")
 
-    try:
-        bot.add_view(PerfilView())
-    except Exception:
-        pass
-
-    try:
-        bot.add_view(LojaView())
-    except Exception:
-        pass
-
-    print(f"Views persistentes registradas: {total}")
 
 # =========================
 # VIEW FILA
@@ -251,11 +195,7 @@ class FilaStreamerView(discord.ui.View):
 
 class EntrarStreamer(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(
-            label="✅ Entrar na Fila",
-            style=discord.ButtonStyle.success,
-            custom_id=make_custom_id("entrar_streamer", nome)
-        )
+        super().__init__(label="✅ Entrar na Fila", style=discord.ButtonStyle.success, custom_id=f"entrar_streamer:{nome}")
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -301,11 +241,7 @@ class EntrarStreamer(discord.ui.Button):
 
 class SairStreamer(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(
-            label="❌ Sair da Fila",
-            style=discord.ButtonStyle.danger,
-            custom_id=make_custom_id("sair_streamer", nome)
-        )
+        super().__init__(label="❌ Sair da Fila", style=discord.ButtonStyle.danger, custom_id=f"sair_streamer:{nome}")
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -329,11 +265,7 @@ class SairStreamer(discord.ui.Button):
 
 class Entrar(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(
-            label="Entrar na fila",
-            style=discord.ButtonStyle.success,
-            custom_id=make_custom_id("entrar", nome)
-        )
+        super().__init__(label="Entrar na fila", style=discord.ButtonStyle.success, custom_id=f"entrar:{nome}")
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -342,11 +274,7 @@ class Entrar(discord.ui.Button):
 
 class GelNormal(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(
-            label="🧊 Gel Normal",
-            style=discord.ButtonStyle.primary,
-            custom_id=make_custom_id("gel_normal", nome)
-        )
+        super().__init__(label="🧊 Gel Normal", style=discord.ButtonStyle.primary, custom_id=f"gel_normal:{nome}")
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -355,11 +283,7 @@ class GelNormal(discord.ui.Button):
 
 class GelInfinito(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(
-            label="🧊 Gel Infinito",
-            style=discord.ButtonStyle.secondary,
-            custom_id=make_custom_id("gel_infinito", nome)
-        )
+        super().__init__(label="🧊 Gel Infinito", style=discord.ButtonStyle.secondary, custom_id=f"gel_infinito:{nome}")
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -368,11 +292,7 @@ class GelInfinito(discord.ui.Button):
 
 class Emu1(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(
-            label="💻 1 Emu",
-            style=discord.ButtonStyle.primary,
-            custom_id=make_custom_id("emu1", nome)
-        )
+        super().__init__(label="💻 1 Emu", style=discord.ButtonStyle.primary, custom_id=f"emu1:{nome}")
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -381,11 +301,7 @@ class Emu1(discord.ui.Button):
 
 class Emu2(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(
-            label="💻 2 Emu",
-            style=discord.ButtonStyle.secondary,
-            custom_id=make_custom_id("emu2", nome)
-        )
+        super().__init__(label="💻 2 Emu", style=discord.ButtonStyle.secondary, custom_id=f"emu2:{nome}")
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -394,11 +310,7 @@ class Emu2(discord.ui.Button):
 
 class Emu3(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(
-            label="💻 3 Emu",
-            style=discord.ButtonStyle.success,
-            custom_id=make_custom_id("emu3", nome)
-        )
+        super().__init__(label="💻 3 Emu", style=discord.ButtonStyle.success, custom_id=f"emu3:{nome}")
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -407,11 +319,7 @@ class Emu3(discord.ui.Button):
 
 class Sair(discord.ui.Button):
     def __init__(self, nome):
-        super().__init__(
-            label="❌ Sair da fila",
-            style=discord.ButtonStyle.danger,
-            custom_id=make_custom_id("sair", nome)
-        )
+        super().__init__(label="❌ Sair da fila", style=discord.ButtonStyle.danger, custom_id=f"sair:{nome}")
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
@@ -447,11 +355,7 @@ class BlacklistView(discord.ui.View):
 
 class VerificarButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(
-            label="🔍 Verificar ID",
-            style=discord.ButtonStyle.primary,
-            custom_id="blacklist:verificar"
-        )
+        super().__init__(label="🔍 Verificar ID", style=discord.ButtonStyle.primary)
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(VerificarModal())
@@ -498,8 +402,7 @@ class LojaButton(discord.ui.Button):
     def __init__(self):
         super().__init__(
             label="Clique aqui para comprar algum item da loja...",
-            style=discord.ButtonStyle.green,
-            custom_id="loja:abrir"
+            style=discord.ButtonStyle.green
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -1155,6 +1058,28 @@ async def resetar_filas(interaction: discord.Interaction):
     await interaction.response.send_message("Todas as filas, coins, ranking, derrotas e loja foram resetadas.")
 
 
+@tree.command(name="deletar_fila", description="Deletar uma fila específica pelo nome completo")
+@app_commands.check(is_admin)
+async def deletar_fila(interaction: discord.Interaction, nome_fila: str):
+    dados = carregar()
+
+    if nome_fila not in dados["filas"]:
+        filas = "\n".join(dados["filas"].keys()) or "Nenhuma fila salva."
+        await interaction.response.send_message(
+            f"❌ Fila não encontrada.\n\nFilas salvas:\n```{filas}```",
+            ephemeral=True
+        )
+        return
+
+    del dados["filas"][nome_fila]
+    salvar(dados)
+
+    await interaction.response.send_message(
+        f"✅ Fila **{nome_fila}** deletada do banco.",
+        ephemeral=True
+    )
+
+
 @tree.command(name="resetar_coins", description="Zerar as LinCoins de todos os jogadores")
 @app_commands.check(is_admin)
 async def resetar_coins(interaction: discord.Interaction):
@@ -1379,18 +1304,21 @@ async def painel(ctx):
 if not TOKEN:
     raise ValueError("Defina a variável de ambiente DISCORD_TOKEN antes de rodar o bot.")
 
+# =========================
+# KEEP ALIVE PARA RENDER
+# =========================
+
 app = Flask(__name__)
 
 @app.route("/")
 def home():
     return "Bot online!"
 
-def run():
+def run_web():
     app.run(host="0.0.0.0", port=10000)
 
 def keep_alive():
-    t = Thread(target=run)
-    t.start()
+    Thread(target=run_web, daemon=True).start()
 
 keep_alive()
 
