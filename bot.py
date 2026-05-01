@@ -182,6 +182,9 @@ def registrar_views_persistentes():
                 bot.add_view(FilaStreamerView(nome))
             else:
                 bot.add_view(FilaView(nome))
+                compat = FilaCompatAntigaView(nome)
+                if len(compat.children) > 0:
+                    bot.add_view(compat)
             total += 1
         except Exception as e:
             print(f"Aviso: não foi possível registrar view da fila {nome}: {e}")
@@ -473,6 +476,28 @@ class Sair(discord.ui.Button):
         salvar(dados)
         await interaction.response.send_message("❌ Você saiu da fila.", ephemeral=True)
         await atualizar_embed(interaction, self.nome)
+
+
+class FilaCompatAntigaView(discord.ui.View):
+    """Registra botões de mensagens antigas para não falharem depois de deploy.
+
+    Exemplo: antes algumas filas 1v1 Emulador/Mobile tinham o botão verde
+    "Entrar na fila". Na versão nova elas usam "1 Emu". Sem esta view,
+    essas mensagens antigas ficam com "Esta interação falhou" após reiniciar.
+    """
+    def __init__(self, nome):
+        super().__init__(timeout=None)
+        tipo = tipo_fila(nome)
+
+        if tipo == "1v1_1emu":
+            self.add_item(Entrar(nome))
+
+        elif tipo == "2v2_misto":
+            self.add_item(Emu2(nome))
+
+        elif tipo == "3v3_misto":
+            self.add_item(Emu3(nome))
+
 
 
 # =========================
