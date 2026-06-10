@@ -1300,7 +1300,7 @@ async def autocomplete_filas(interaction: discord.Interaction, current: str):
     return [app_commands.Choice(name=n[:100], value=n) for n in filtradas[:25]]
 
 
-@tree.command(name="encerrar_fila", description="Fechar sala privada da aposta sem apagar a fila principal")
+@tree.command(name="encerrar_fila", description="Fechar sala privada da aposta e limpar jogadores da fila")
 @app_commands.check(is_admin)
 @app_commands.autocomplete(nome=autocomplete_filas)
 async def encerrar_fila(interaction: discord.Interaction, nome: str = None):
@@ -1313,12 +1313,11 @@ async def encerrar_fila(interaction: discord.Interaction, nome: str = None):
     canal_atual = interaction.channel
     topico_atual = (getattr(canal_atual, "topic", "") or "").strip()
 
-    # Se o comando for usado dentro da sala privada, pega o nome da fila pelo tópico FILA:nome
+    # Se usar dentro da sala privada, pega a fila pelo tópico do canal
     if topico_atual.startswith("FILA:"):
-        candidato = topico_atual.replace("FILA:", "", 1).strip()
-        nome_escolhido = candidato
+        nome_escolhido = topico_atual.replace("FILA:", "", 1).strip()
 
-    # Se o admin informar o nome manualmente, usa esse nome para procurar salas privadas dessa fila
+    # Se o admin escolher uma fila manualmente
     if nome:
         if nome in filas:
             nome_escolhido = nome
@@ -1327,52 +1326,67 @@ async def encerrar_fila(interaction: discord.Interaction, nome: str = None):
                 if fila_nome.lower() == nome.lower():
                     nome_escolhido = fila_nome
                     break
+
             if not nome_escolhido:
                 nome_escolhido = nome.strip()
 
-    # IMPORTANTE: não apaga dados["filas"] aqui.
-    # Esse comando fecha somente a sala/canal privado da aposta.
-    canais_para_deletar = []
-
-    try:
-        if topico_atual.startswith("FILA:"):
-            canais_para_deletar.append(canal_atual)
-        elif nome_escolhido:
-            for canal in interaction.guild.text_channels:
-                topico = (getattr(canal, "topic", "") or "").strip()
-                if topico == f"FILA:{nome_escolhido}":
-                    canais_para_deletar.append(canal)
-    except Exception as e:
-        print(f"Aviso: erro ao procurar canais privados da fila: {e}")
-
-    if not canais_para_deletar:
+    if not nome_escolhido:
         await interaction.followup.send(
-            "❌ Não encontrei sala privada para fechar.\n"
-            "Use este comando dentro do canal da partida, ou informe o nome da fila.",
+            "❌ Não consegui identificar a fila. Use dentro da sala privada ou escolha o nome da fila.",
             ephemeral=True
         )
         return
 
-    nomes_canais = ", ".join([c.mention for c in canais_para_deletar[:5]])
+    # Limpa jogadores presos na fila
+    if nome_escolhido in filas:
+        filas[nome_escolhido]["jogadores"] = []
+        filas[nome_escolhido]["modo"] = {}
+        filas[nome_escolhido]["em_partida"] = False
+        salvar(dados)
+
+    canais_para_deletar = []
+
+    # Se estiver dentro da sala privada, fecha esse canal
+    if topico_atual.startswith("FILA:"):
+        canais_para_deletar.append(canal_atual)
+    else:
+        # Se usou /encerrar_fila nome, procura salas privadas dessa fila
+        for canal in interaction.guild.text_channels:
+            topico = (getattr(canal, "topic", "") or "").strip()
+            if topico == f"FILA:{nome_escolhido}":
+                canais_para_deletar.append(canal)
+
+    if not canais_para_deletar:
+        await interaction.followup.send(
+            f"✅ Fila **{nome_escolhido}** limpa, mas não achei sala privada aberta para fechar.",
+            ephemeral=True
+        )
+        return
+
     await interaction.followup.send(
-        f"✅ Fechando sala privada da aposta.\n"
-        f"🎮 Fila principal mantida salva: **{nome_escolhido or 'detectada pelo canal'}**\n"
-        f"🗑️ Canal(is): {nomes_canais}",
+        f"✅ Encerrando {len(canais_para_deletar)} sala(s) da fila **{nome_escolhido}** e removendo jogadores presos.",
         ephemeral=True
     )
 
-    await asyncio.sleep(2)
-
-    canais_deletados = 0
     for canal in canais_para_deletar:
         try:
-            await canal.delete(reason=f"Sala privada encerrada por {interaction.user}")
-            canais_deletados += 1
+            await canal.delete(reason=f"Fila encerrada por {interaction.user}")
         except Exception as e:
-            print(f"Aviso: não consegui deletar canal {getattr(canal, 'name', canal)}: {e}")
+            print(f"Erro ao deletar canal {canal.name}: {e}")
 
-    print(f"Sala privada encerrada | fila_mantida={nome_escolhido} | canais_deletados={canais_deletados}")
 
+@encerrar_fila.error
+async def encerrar_fila_error(interaction: discord.Interaction, error):
+    if interaction.response.is_done():
+        send = interaction.followup.send
+    else:
+        send = interaction.response.send_message
+
+    if isinstance(error, app_commands.CheckFailure):
+        await send("❌ Você precisa ser administrador para encerrar fila.", ephemeral=True)
+    else:
+        await send(f"❌ Erro ao encerrar fila: {error}", ephemeral=True)
+        print(f"Erro no /encerrar_fila: {error}")
 
 @encerrar_fila.error
 async def encerrar_fila_error(interaction: discord.Interaction, error):
