@@ -1,10 +1,11 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 import json
 import asyncio
 import random
 import hashlib
+import time
 from flask import Flask
 from threading import Thread
 
@@ -47,7 +48,9 @@ def dados_padrao():
         "derrotas": {},
         "loja": {},
         "blacklist": [],
-        "coins": {}
+        "coins": {},
+        "fila_tempo": {},
+        "perfis": {}
     }
 
 
@@ -159,6 +162,9 @@ async def on_ready():
         registrar_views_persistentes()
         bot.views_persistentes_registradas = True
 
+    if not limpar_filas_presos.is_running():
+        limpar_filas_presos.start()
+
     print(f"Bot online como {bot.user}")
 
 
@@ -206,6 +212,69 @@ def registrar_views_persistentes():
         pass
 
     print(f"Views persistentes registradas: {total}")
+
+# =========================
+# LIMPEZA AUTOMÁTICA DE FILAS
+# =========================
+
+TEMPO_MAXIMO_FILA = 20 * 60  # 20 minutos
+
+def limpar_jogadores_antigos(dados: dict) -> int:
+    """Remove jogadores presos há mais de 20 minutos somente das filas normais.
+    Não mexe em ranking, coins, blacklist, loja/presentes ou perfil.
+    """
+    dados = _corrigir_dados(dados)
+    agora = time.time()
+    fila_tempo = dados.setdefault("fila_tempo", {})
+    removidos = 0
+
+    for nome, fila in list(dados.get("filas", {}).items()):
+        # fila de streamer cria sala separada; não limpamos aqui para não remover fila de live ativa.
+        if "streamer" in fila:
+            continue
+
+        jogadores = fila.get("jogadores", [])
+        modo = fila.setdefault("modo", {})
+        novos_jogadores = []
+
+        for uid in jogadores:
+            uid_str = str(uid)
+            entrou_em = fila_tempo.get(nome, {}).get(uid_str)
+
+            # Se veio de versão antiga sem horário, começa a contar agora.
+            if entrou_em is None:
+                fila_tempo.setdefault(nome, {})[uid_str] = agora
+                novos_jogadores.append(uid)
+                continue
+
+            if agora - float(entrou_em) >= TEMPO_MAXIMO_FILA:
+                removidos += 1
+                modo.pop(uid_str, None)
+                fila_tempo.get(nome, {}).pop(uid_str, None)
+            else:
+                novos_jogadores.append(uid)
+
+        fila["jogadores"] = novos_jogadores
+
+    return removidos
+
+
+@tasks.loop(seconds=60)
+async def limpar_filas_presos():
+    try:
+        dados = carregar()
+        removidos = limpar_jogadores_antigos(dados)
+        if removidos > 0:
+            salvar(dados)
+            print(f"Limpeza automática: {removidos} jogador(es) removido(s) de filas normais após 20 minutos.")
+    except Exception as e:
+        print(f"Erro na limpeza automática das filas: {e}")
+
+
+@limpar_filas_presos.before_loop
+async def antes_limpar_filas_presos():
+    await bot.wait_until_ready()
+
 
 # =========================
 # VIEW FILA
@@ -546,6 +615,7 @@ class Sair(discord.ui.Button):
         fila["jogadores"].remove(interaction.user.id)
         if "modo" in fila and str(interaction.user.id) in fila["modo"]:
             del fila["modo"][str(interaction.user.id)]
+        dados.setdefault("fila_tempo", {}).setdefault(self.nome, {}).pop(str(interaction.user.id), None)
 
         salvar(dados)
         await interaction.response.send_message("❌ Você saiu da fila.", ephemeral=True)
@@ -721,7 +791,7 @@ class PerfilView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Perfil", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Perfil", style=discord.ButtonStyle.primary, custom_id="perfil:ver")
     async def ver_perfil(self, interaction: discord.Interaction, button: discord.ui.Button):
         dados = carregar()
         user_id = str(interaction.user.id)
@@ -778,7 +848,7 @@ class PerfilLojaView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=60)
 
-    @discord.ui.button(label="🛒 Ir para Loja", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="🛒 Ir para Loja", style=discord.ButtonStyle.success, custom_id="perfil:loja")
     async def ir_loja(self, interaction: discord.Interaction, button: discord.ui.Button):
         dados = carregar()
         user_id = str(interaction.user.id)
@@ -968,6 +1038,8 @@ async def entrar_fila(interaction, nome, emuladores=1):
     fila["jogadores"].append(user.id)
     fila["modo"][str(user.id)] = emuladores
 
+    dados.setdefault("fila_tempo", {}).setdefault(nome, {})[str(user.id)] = time.time()
+
     salvar(dados)
 
     tipo = tipo_fila(nome)
@@ -999,6 +1071,7 @@ async def entrar_fila(interaction, nome, emuladores=1):
                 fila["jogadores"].remove(uid)
             if str(uid) in fila["modo"]:
                 del fila["modo"][str(uid)]
+            dados.setdefault("fila_tempo", {}).setdefault(nome, {}).pop(str(uid), None)
 
         salvar(dados)
 
