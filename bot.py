@@ -343,45 +343,64 @@ class EntrarStreamer(discord.ui.Button):
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
         dados = carregar()
         fila = dados["filas"].get(self.nome)
 
         if not fila:
-            await interaction.response.send_message("Fila não encontrada.", ephemeral=True)
+            await interaction.followup.send("Fila não encontrada.", ephemeral=True)
             return
 
         if interaction.user.id in fila["jogadores"]:
-            await interaction.response.send_message("Você já está na fila.", ephemeral=True)
+            await interaction.followup.send("Você já está nessa fila.", ephemeral=True)
             return
 
-        if "em_partida" not in fila:
-            fila["em_partida"] = False
+        if interaction.user.id == fila.get("streamer"):
+            await interaction.followup.send("Você não pode entrar na sua própria fila.", ephemeral=True)
+            return
 
         fila["jogadores"].append(interaction.user.id)
+        if "modo" not in fila:
+            fila["modo"] = {}
+
         salvar(dados)
 
-        await interaction.response.send_message("Você entrou na fila!", ephemeral=True)
+        try:
+            await atualizar_embed(interaction, self.nome)
+        except Exception as e:
+            print(f"Erro ao atualizar embed streamer: {e}")
 
-        if not fila["em_partida"]:
-            fila["em_partida"] = True
-            salvar(dados)
+        streamer = interaction.guild.get_member(fila["streamer"])
+        jogador = interaction.guild.get_member(interaction.user.id)
 
-            proximo_id = fila["jogadores"].pop(0)
-            salvar(dados)
+        if streamer and jogador:
+            await criar_sala_privada(
+                interaction.guild,
+                [jogador, streamer],
+                self.nome,
+                1
+            )
 
-            streamer = interaction.guild.get_member(fila["streamer"])
-            jogador = interaction.guild.get_member(proximo_id)
+        # Remove da lista depois de criar a sala privada,
+        # assim outra pessoa pode entrar e criar outra sala separada.
+        dados = carregar()
+        fila = dados["filas"].get(self.nome)
 
-            if streamer and jogador:
-                await criar_sala_privada(
-                    interaction.guild,
-                    [jogador, streamer],
-                    self.nome,
-                    1
-                )
+        if fila and interaction.user.id in fila["jogadores"]:
+            fila["jogadores"].remove(interaction.user.id)
 
-        await atualizar_embed(interaction, self.nome)
+        salvar(dados)
 
+        try:
+            await atualizar_embed(interaction, self.nome)
+        except Exception as e:
+            print(f"Erro ao atualizar embed final streamer: {e}")
+
+        await interaction.followup.send(
+            "✅ Você entrou na fila e sua sala privada foi criada.",
+            ephemeral=True
+        )
 
 class SairStreamer(discord.ui.Button):
     def __init__(self, nome):
