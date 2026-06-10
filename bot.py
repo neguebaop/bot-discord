@@ -327,6 +327,31 @@ def extrair_valor_fila(nome: str) -> float:
     return 0.0
 
 
+
+def uid_str(user_id):
+    return str(user_id)
+
+def lista_tem_usuario(lista, user_id):
+    return any(str(x) == str(user_id) for x in (lista or []))
+
+def adicionar_usuario_lista(lista, user_id):
+    if not lista_tem_usuario(lista, user_id):
+        lista.append(uid_str(user_id))
+
+def remover_usuario_lista(lista, user_id):
+    removidos = 0
+    for item in list(lista or []):
+        if str(item) == str(user_id):
+            lista.remove(item)
+            removidos += 1
+    return removidos
+
+def guild_get_member_safe(guild, user_id):
+    try:
+        return guild.get_member(int(user_id))
+    except Exception:
+        return None
+
 def garantir_fila_salva(dados: dict, nome: str) -> dict:
     """Garante que a fila exista no banco.
 
@@ -424,16 +449,16 @@ class EntrarStreamer(discord.ui.Button):
             await interaction.followup.send("❌ Essa fila não é de streamer.", ephemeral=True)
             return
 
-        if interaction.user.id == fila.get("streamer"):
+        if str(interaction.user.id) == str(fila.get("streamer")):
             await interaction.followup.send("❌ Você não pode entrar na sua própria fila.", ephemeral=True)
             return
 
         if "salas_criadas" not in fila or not isinstance(fila.get("salas_criadas"), list):
             fila["salas_criadas"] = []
+        if "jogadores" not in fila or not isinstance(fila.get("jogadores"), list):
+            fila["jogadores"] = []
 
-        if interaction.user.id not in fila["jogadores"]:
-            fila["jogadores"].append(interaction.user.id)
-
+        adicionar_usuario_lista(fila["jogadores"], interaction.user.id)
         salvar(dados)
 
         try:
@@ -441,19 +466,20 @@ class EntrarStreamer(discord.ui.Button):
         except Exception as e:
             print(f"Erro ao atualizar embed da fila streamer: {e}")
 
-        streamer = interaction.guild.get_member(fila["streamer"])
-        jogador = interaction.guild.get_member(interaction.user.id)
+        streamer = guild_get_member_safe(interaction.guild, fila["streamer"])
+        jogador = guild_get_member_safe(interaction.guild, interaction.user.id)
 
         if not streamer or not jogador:
             await interaction.followup.send(
-                "❌ Não consegui encontrar o streamer ou o jogador no servidor.",
+                "❌ Entrei na fila, mas não achei o streamer ou jogador no servidor.",
                 ephemeral=True
             )
             return
 
-        if interaction.user.id in fila["salas_criadas"]:
+        # Se já criou sala para esse jogador, não cria duplicada.
+        if lista_tem_usuario(fila.get("salas_criadas", []), interaction.user.id):
             await interaction.followup.send(
-                "✅ Você já está na fila. Sua sala já foi criada ou está aguardando.",
+                "✅ Você já está na fila. Sua sala já foi criada.",
                 ephemeral=True
             )
             return
@@ -468,10 +494,9 @@ class EntrarStreamer(discord.ui.Button):
 
             dados = carregar()
             fila = garantir_fila_salva(dados, self.nome)
-
-            if interaction.user.id not in fila["salas_criadas"]:
-                fila["salas_criadas"].append(interaction.user.id)
-
+            if "salas_criadas" not in fila or not isinstance(fila.get("salas_criadas"), list):
+                fila["salas_criadas"] = []
+            adicionar_usuario_lista(fila["salas_criadas"], interaction.user.id)
             salvar(dados)
 
             await interaction.followup.send(
@@ -482,7 +507,7 @@ class EntrarStreamer(discord.ui.Button):
         except Exception as e:
             print(f"Erro ao criar sala privada da fila streamer: {e}")
             await interaction.followup.send(
-                "❌ Entrei na fila, mas não consegui criar a sala privada. Verifique as permissões do cargo do bot.",
+                "❌ Entrei na fila, mas não consegui criar a sala privada. Verifique se o bot tem Gerenciar Canais e se o cargo dele está acima dos outros.",
                 ephemeral=True
             )
 
@@ -499,21 +524,47 @@ class SairStreamer(discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
 
         dados = carregar()
+        removido = False
+        nome_para_atualizar = self.nome
+
+        # Primeiro tenta pela fila do botão.
         fila = garantir_fila_salva(dados, self.nome)
+        if "jogadores" not in fila or not isinstance(fila.get("jogadores"), list):
+            fila["jogadores"] = []
+        if "salas_criadas" not in fila or not isinstance(fila.get("salas_criadas"), list):
+            fila["salas_criadas"] = []
 
-        if interaction.user.id not in fila["jogadores"]:
-            await interaction.followup.send("Você não está na fila.", ephemeral=True)
-            return
+        if lista_tem_usuario(fila["jogadores"], interaction.user.id) or lista_tem_usuario(fila["salas_criadas"], interaction.user.id):
+            remover_usuario_lista(fila["jogadores"], interaction.user.id)
+            remover_usuario_lista(fila["salas_criadas"], interaction.user.id)
+            removido = True
 
-        fila["jogadores"].remove(interaction.user.id)
-
-        if "salas_criadas" in fila and interaction.user.id in fila["salas_criadas"]:
-            fila["salas_criadas"].remove(interaction.user.id)
+        # Segurança: se por algum bug antigo ele estiver preso em outra fila streamer, remove também.
+        for nome_fila, info in dados.get("filas", {}).items():
+            if not isinstance(info, dict) or "streamer" not in info:
+                continue
+            if "jogadores" not in info or not isinstance(info.get("jogadores"), list):
+                info["jogadores"] = []
+            if "salas_criadas" not in info or not isinstance(info.get("salas_criadas"), list):
+                info["salas_criadas"] = []
+            if lista_tem_usuario(info["jogadores"], interaction.user.id) or lista_tem_usuario(info["salas_criadas"], interaction.user.id):
+                remover_usuario_lista(info["jogadores"], interaction.user.id)
+                remover_usuario_lista(info["salas_criadas"], interaction.user.id)
+                nome_para_atualizar = nome_fila
+                removido = True
 
         salvar(dados)
 
-        await interaction.followup.send("Você saiu da fila.", ephemeral=True)
-        await atualizar_embed(interaction, self.nome)
+        try:
+            await atualizar_embed(interaction, nome_para_atualizar)
+        except Exception as e:
+            print(f"Erro ao atualizar embed após sair: {e}")
+
+        if removido:
+            await interaction.followup.send("✅ Você saiu da fila.", ephemeral=True)
+        else:
+            # Não trava mais o usuário com mensagem falsa. O botão limpa mesmo assim.
+            await interaction.followup.send("✅ Limpei sua fila. Se seu nome ainda aparecer, reinicie a mensagem criando a fila novamente.", ephemeral=True)
 
 
 class Entrar(discord.ui.Button):
@@ -608,11 +659,11 @@ class Sair(discord.ui.Button):
         # Não deixa mensagem antiga morrer se o registro sumiu do banco.
         fila = garantir_fila_salva(dados, self.nome)
 
-        if interaction.user.id not in fila["jogadores"]:
+        if not lista_tem_usuario(fila["jogadores"], interaction.user.id):
             await interaction.response.send_message("Você não está nessa fila.", ephemeral=True)
             return
 
-        fila["jogadores"].remove(interaction.user.id)
+        remover_usuario_lista(fila["jogadores"], interaction.user.id)
         if "modo" in fila and str(interaction.user.id) in fila["modo"]:
             del fila["modo"][str(interaction.user.id)]
         dados.setdefault("fila_tempo", {}).setdefault(self.nome, {}).pop(str(interaction.user.id), None)
@@ -1030,12 +1081,12 @@ async def entrar_fila(interaction, nome, emuladores=1):
     # recria automaticamente em vez de quebrar com "Fila não encontrada".
     fila = garantir_fila_salva(dados, nome)
 
-    if user.id in fila["jogadores"]:
-        fila["jogadores"].remove(user.id)
+    if lista_tem_usuario(fila["jogadores"], user.id):
+        remover_usuario_lista(fila["jogadores"], user.id)
         if str(user.id) in fila["modo"]:
             del fila["modo"][str(user.id)]
 
-    fila["jogadores"].append(user.id)
+    adicionar_usuario_lista(fila["jogadores"], user.id)
     fila["modo"][str(user.id)] = emuladores
 
     dados.setdefault("fila_tempo", {}).setdefault(nome, {})[str(user.id)] = time.time()
@@ -1062,13 +1113,13 @@ async def entrar_fila(interaction, nome, emuladores=1):
 
     if len(jogadores_mesmo_modo) >= necessario:
         membros = [
-            interaction.guild.get_member(uid)
+            guild_get_member_safe(interaction.guild, uid)
             for uid in jogadores_mesmo_modo[:2]
         ]
 
         for uid in jogadores_mesmo_modo[:2]:
-            if uid in fila["jogadores"]:
-                fila["jogadores"].remove(uid)
+            if lista_tem_usuario(fila["jogadores"], uid):
+                remover_usuario_lista(fila["jogadores"], uid)
             if str(uid) in fila["modo"]:
                 del fila["modo"][str(uid)]
             dados.setdefault("fila_tempo", {}).setdefault(nome, {}).pop(str(uid), None)
@@ -1094,7 +1145,7 @@ async def atualizar_embed(interaction, nome):
         jogadores_texto = ""
 
         for i, user_id in enumerate(fila["jogadores"], start=1):
-            membro = interaction.guild.get_member(user_id)
+            membro = guild_get_member_safe(interaction.guild, user_id)
             if membro:
                 jogadores_texto += f"**{i}.** {membro.mention}\n"
 
@@ -1102,7 +1153,7 @@ async def atualizar_embed(interaction, nome):
             jogadores_texto = "Nenhum aguardando."
 
         streamer_id = fila["streamer"]
-        streamer_membro = interaction.guild.get_member(streamer_id)
+        streamer_membro = guild_get_member_safe(interaction.guild, streamer_id)
 
         if not streamer_membro:
             return
@@ -1127,7 +1178,7 @@ async def atualizar_embed(interaction, nome):
         fila["modo"] = {}
 
     for user_id in fila["jogadores"]:
-        membro = interaction.guild.get_member(user_id)
+        membro = guild_get_member_safe(interaction.guild, user_id)
         if not membro:
             continue
 
