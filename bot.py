@@ -90,7 +90,8 @@ def salvar(dados):
             "user_id": "bot",
             "fila_nome": "principal",
             "dados": dados
-        }).execute()
+        }, on_conflict="id").execute()
+        _salvar_local(dados)  # backup local também
     except Exception as e:
         print(f"Erro ao salvar no Supabase, salvando localmente: {e}")
         _salvar_local(dados)
@@ -286,6 +287,8 @@ def garantir_fila_salva(dados: dict, nome: str) -> dict:
         fila["valor"] = extrair_valor_fila(nome)
     if "max" not in fila:
         fila["max"] = 50
+    if "salas_criadas" not in fila or not isinstance(fila.get("salas_criadas"), list):
+        fila["salas_criadas"] = []
     return fila
 
 
@@ -346,35 +349,47 @@ class EntrarStreamer(discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
 
         dados = carregar()
-        fila = dados["filas"].get(self.nome)
+        fila = garantir_fila_salva(dados, self.nome)
 
-        if not fila:
-            await interaction.followup.send("Fila não encontrada.", ephemeral=True)
-            return
-
-        if interaction.user.id in fila["jogadores"]:
-            await interaction.followup.send("Você já está nessa fila.", ephemeral=True)
+        if "streamer" not in fila:
+            await interaction.followup.send("❌ Essa fila não é de streamer.", ephemeral=True)
             return
 
         if interaction.user.id == fila.get("streamer"):
-            await interaction.followup.send("Você não pode entrar na sua própria fila.", ephemeral=True)
+            await interaction.followup.send("❌ Você não pode entrar na sua própria fila.", ephemeral=True)
             return
 
-        fila["jogadores"].append(interaction.user.id)
-        if "modo" not in fila:
-            fila["modo"] = {}
+        if "salas_criadas" not in fila or not isinstance(fila.get("salas_criadas"), list):
+            fila["salas_criadas"] = []
+
+        if interaction.user.id not in fila["jogadores"]:
+            fila["jogadores"].append(interaction.user.id)
 
         salvar(dados)
 
         try:
             await atualizar_embed(interaction, self.nome)
         except Exception as e:
-            print(f"Erro ao atualizar embed streamer: {e}")
+            print(f"Erro ao atualizar embed da fila streamer: {e}")
 
         streamer = interaction.guild.get_member(fila["streamer"])
         jogador = interaction.guild.get_member(interaction.user.id)
 
-        if streamer and jogador:
+        if not streamer or not jogador:
+            await interaction.followup.send(
+                "❌ Não consegui encontrar o streamer ou o jogador no servidor.",
+                ephemeral=True
+            )
+            return
+
+        if interaction.user.id in fila["salas_criadas"]:
+            await interaction.followup.send(
+                "✅ Você já está na fila. Sua sala já foi criada ou está aguardando.",
+                ephemeral=True
+            )
+            return
+
+        try:
             await criar_sala_privada(
                 interaction.guild,
                 [jogador, streamer],
@@ -382,25 +397,25 @@ class EntrarStreamer(discord.ui.Button):
                 1
             )
 
-        # Remove da lista depois de criar a sala privada,
-        # assim outra pessoa pode entrar e criar outra sala separada.
-        dados = carregar()
-        fila = dados["filas"].get(self.nome)
+            dados = carregar()
+            fila = garantir_fila_salva(dados, self.nome)
 
-        if fila and interaction.user.id in fila["jogadores"]:
-            fila["jogadores"].remove(interaction.user.id)
+            if interaction.user.id not in fila["salas_criadas"]:
+                fila["salas_criadas"].append(interaction.user.id)
 
-        salvar(dados)
+            salvar(dados)
 
-        try:
-            await atualizar_embed(interaction, self.nome)
+            await interaction.followup.send(
+                "✅ Você entrou na fila e sua sala privada foi criada.",
+                ephemeral=True
+            )
+
         except Exception as e:
-            print(f"Erro ao atualizar embed final streamer: {e}")
-
-        await interaction.followup.send(
-            "✅ Você entrou na fila e sua sala privada foi criada.",
-            ephemeral=True
-        )
+            print(f"Erro ao criar sala privada da fila streamer: {e}")
+            await interaction.followup.send(
+                "❌ Entrei na fila, mas não consegui criar a sala privada. Verifique as permissões do cargo do bot.",
+                ephemeral=True
+            )
 
 class SairStreamer(discord.ui.Button):
     def __init__(self, nome):
@@ -412,21 +427,23 @@ class SairStreamer(discord.ui.Button):
         self.nome = nome
 
     async def callback(self, interaction: discord.Interaction):
-        dados = carregar()
-        fila = dados["filas"].get(self.nome)
+        await interaction.response.defer(ephemeral=True)
 
-        if not fila:
-            await interaction.response.send_message("Fila não encontrada.", ephemeral=True)
-            return
+        dados = carregar()
+        fila = garantir_fila_salva(dados, self.nome)
 
         if interaction.user.id not in fila["jogadores"]:
-            await interaction.response.send_message("Você não está na fila.", ephemeral=True)
+            await interaction.followup.send("Você não está na fila.", ephemeral=True)
             return
 
         fila["jogadores"].remove(interaction.user.id)
+
+        if "salas_criadas" in fila and interaction.user.id in fila["salas_criadas"]:
+            fila["salas_criadas"].remove(interaction.user.id)
+
         salvar(dados)
 
-        await interaction.response.send_message("Você saiu da fila.", ephemeral=True)
+        await interaction.followup.send("Você saiu da fila.", ephemeral=True)
         await atualizar_embed(interaction, self.nome)
 
 
@@ -813,7 +830,7 @@ async def criar_sala_privada(guild, membros, nome_fila, emuladores):
         name=nome_canal,
         category=categoria,
         overwrites=overwrites,
-        topic=f"FILA:{nome_fila}"
+        topic=f"FILA:{nome_fila}|PLAYERS:{','.join(str(m.id) for m in membros if m is not None)}"
     )
 
     mediadores = [
@@ -1206,7 +1223,8 @@ async def criar_fila_streamer(
         "formato": formato,
         "regras": regras,
         "em_partida": False,
-        "modo": {}
+        "modo": {},
+        "salas_criadas": []
     }
 
     salvar(dados)
@@ -1261,7 +1279,8 @@ async def criar_fila(interaction: discord.Interaction, nome: str, valor: float, 
         "valor": valor,
         "max": max_jogadores,
         "jogadores": [],
-        "modo": {}
+        "modo": {},
+        "salas_criadas": []
     }
 
     salvar(dados)
@@ -1300,7 +1319,7 @@ async def autocomplete_filas(interaction: discord.Interaction, current: str):
     return [app_commands.Choice(name=n[:100], value=n) for n in filtradas[:25]]
 
 
-@tree.command(name="encerrar_fila", description="Fechar sala privada da aposta e limpar jogadores da fila")
+@tree.command(name="encerrar_fila", description="Fechar sala privada e remover os jogadores dessa partida da fila")
 @app_commands.check(is_admin)
 @app_commands.autocomplete(nome=autocomplete_filas)
 async def encerrar_fila(interaction: discord.Interaction, nome: str = None):
@@ -1309,15 +1328,27 @@ async def encerrar_fila(interaction: discord.Interaction, nome: str = None):
     dados = carregar()
     filas = dados.get("filas", {})
 
-    nome_escolhido = None
     canal_atual = interaction.channel
     topico_atual = (getattr(canal_atual, "topic", "") or "").strip()
 
-    # Se usar dentro da sala privada, pega a fila pelo tópico do canal
-    if topico_atual.startswith("FILA:"):
-        nome_escolhido = topico_atual.replace("FILA:", "", 1).strip()
+    nome_escolhido = None
+    jogadores_para_remover = []
 
-    # Se o admin escolher uma fila manualmente
+    # Sala privada nova: FILA:nome|PLAYERS:id,id
+    if topico_atual.startswith("FILA:"):
+        resto = topico_atual.replace("FILA:", "", 1).strip()
+
+        if "|PLAYERS:" in resto:
+            nome_escolhido, players_txt = resto.split("|PLAYERS:", 1)
+            nome_escolhido = nome_escolhido.strip()
+
+            for parte in players_txt.split(","):
+                parte = parte.strip()
+                if parte.isdigit():
+                    jogadores_para_remover.append(int(parte))
+        else:
+            nome_escolhido = resto.strip()
+
     if nome:
         if nome in filas:
             nome_escolhido = nome
@@ -1337,23 +1368,54 @@ async def encerrar_fila(interaction: discord.Interaction, nome: str = None):
         )
         return
 
-    # Limpa jogadores presos na fila
+    # Se estiver dentro de uma sala antiga sem PLAYERS no tópico,
+    # remove os membros humanos desse canal da fila.
+    if not jogadores_para_remover and topico_atual.startswith("FILA:"):
+        try:
+            jogadores_para_remover = [
+                m.id for m in canal_atual.members
+                if not m.bot and m.id != interaction.user.id
+            ]
+        except Exception:
+            jogadores_para_remover = []
+
     if nome_escolhido in filas:
-        filas[nome_escolhido]["jogadores"] = []
-        filas[nome_escolhido]["modo"] = {}
-        filas[nome_escolhido]["em_partida"] = False
+        fila = garantir_fila_salva(dados, nome_escolhido)
+
+        # Se tem jogadores específicos, remove só eles.
+        # Se não tem, limpa a fila inteira.
+        if jogadores_para_remover:
+            fila["jogadores"] = [
+                uid for uid in fila.get("jogadores", [])
+                if uid not in jogadores_para_remover
+            ]
+
+            if "modo" in fila:
+                for uid in jogadores_para_remover:
+                    fila["modo"].pop(str(uid), None)
+
+            if "salas_criadas" in fila:
+                fila["salas_criadas"] = [
+                    uid for uid in fila.get("salas_criadas", [])
+                    if uid not in jogadores_para_remover
+                ]
+        else:
+            fila["jogadores"] = []
+            fila["modo"] = {}
+            fila["salas_criadas"] = []
+
+        fila["em_partida"] = False
         salvar(dados)
 
     canais_para_deletar = []
 
-    # Se estiver dentro da sala privada, fecha esse canal
     if topico_atual.startswith("FILA:"):
         canais_para_deletar.append(canal_atual)
     else:
-        # Se usou /encerrar_fila nome, procura salas privadas dessa fila
         for canal in interaction.guild.text_channels:
             topico = (getattr(canal, "topic", "") or "").strip()
-            if topico == f"FILA:{nome_escolhido}":
+
+            if topico == f"FILA:{nome_escolhido}" or topico.startswith(f"FILA:{nome_escolhido}|PLAYERS:"):
                 canais_para_deletar.append(canal)
 
     if not canais_para_deletar:
@@ -1364,7 +1426,7 @@ async def encerrar_fila(interaction: discord.Interaction, nome: str = None):
         return
 
     await interaction.followup.send(
-        f"✅ Encerrando {len(canais_para_deletar)} sala(s) da fila **{nome_escolhido}** e removendo jogadores presos.",
+        f"✅ Encerrando {len(canais_para_deletar)} sala(s) da fila **{nome_escolhido}**.",
         ephemeral=True
     )
 
@@ -1387,20 +1449,6 @@ async def encerrar_fila_error(interaction: discord.Interaction, error):
     else:
         await send(f"❌ Erro ao encerrar fila: {error}", ephemeral=True)
         print(f"Erro no /encerrar_fila: {error}")
-
-@encerrar_fila.error
-async def encerrar_fila_error(interaction: discord.Interaction, error):
-    if interaction.response.is_done():
-        send = interaction.followup.send
-    else:
-        send = interaction.response.send_message
-
-    if isinstance(error, app_commands.CheckFailure):
-        await send("❌ Você precisa ser administrador para encerrar sala privada.", ephemeral=True)
-    else:
-        await send(f"❌ Erro ao encerrar sala privada: {error}", ephemeral=True)
-        print(f"Erro no /encerrar_fila: {error}")
-
 
 @tree.command(name="resetar_filas", description="Resetar tudo")
 @app_commands.check(is_admin)
