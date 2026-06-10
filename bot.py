@@ -1203,6 +1203,75 @@ async def atualizar_embed(interaction, nome):
 
     await interaction.message.edit(embed=embed, view=FilaView(nome))
 
+async def atualizar_painel_fila_salvo(guild, nome):
+    """Atualiza a mensagem principal da fila usando channel_id/message_id salvos no banco.
+    Isso é usado quando /encerrar_fila é executado dentro da sala privada,
+    porque nesse caso interaction.message NÃO é a mensagem principal da fila.
+    """
+    dados = carregar()
+    fila = dados.get("filas", {}).get(nome)
+    if not fila:
+        return
+
+    channel_id = fila.get("painel_channel_id") or fila.get("channel_id")
+    message_id = fila.get("painel_message_id") or fila.get("message_id")
+    if not channel_id or not message_id:
+        return
+
+    try:
+        canal = guild.get_channel(int(channel_id)) or await guild.fetch_channel(int(channel_id))
+        mensagem = await canal.fetch_message(int(message_id))
+    except Exception as e:
+        print(f"Aviso: não consegui buscar painel da fila {nome}: {e}")
+        return
+
+    try:
+        if "streamer" in fila:
+            jogadores_texto = ""
+            for i, user_id in enumerate(fila.get("jogadores", []), start=1):
+                membro = guild_get_member_safe(guild, user_id)
+                if membro:
+                    jogadores_texto += f"**{i}.** {membro.mention}\n"
+
+            if jogadores_texto == "":
+                jogadores_texto = "Nenhum aguardando."
+
+            streamer_membro = guild_get_member_safe(guild, fila.get("streamer"))
+            titulo = f"🎥 JOGUE CONTRA O {streamer_membro.display_name.upper()}" if streamer_membro else f"🎥 {nome}"
+
+            embed = discord.Embed(title=titulo, color=discord.Color.purple())
+            embed.add_field(name="🎮 Formato", value=fila.get("formato", nome), inline=False)
+            embed.add_field(name="💰 Valor", value=f"R$ {float(fila.get('valor', 0)):.2f}", inline=False)
+            embed.add_field(name="📜 Regras", value=fila.get("regras", "Sem regras."), inline=False)
+            embed.add_field(name="👥 Jogadores", value=jogadores_texto, inline=False)
+            if streamer_membro:
+                embed.set_thumbnail(url=streamer_membro.display_avatar.url)
+
+            await mensagem.edit(embed=embed, view=FilaStreamerView(nome))
+        else:
+            jogadores_texto = ""
+            for user_id in fila.get("jogadores", []):
+                membro = guild_get_member_safe(guild, user_id)
+                if not membro:
+                    continue
+                modo = fila.get("modo", {}).get(str(user_id), 1)
+                modo_txt = texto_modo(nome, modo)
+                jogadores_texto += f"{membro.mention} | {modo_txt}\n" if modo_txt else f"{membro.mention}\n"
+
+            if jogadores_texto == "":
+                jogadores_texto = "Nenhum jogador na fila."
+
+            embed = discord.Embed(color=0x111111)
+            embed.title = f"{nome} | Fila de Competição"
+            embed.add_field(name="📋 Formato", value=nome, inline=False)
+            embed.add_field(name="💰 Valor", value=f"R$ {float(fila.get('valor', 0)):.2f}", inline=False)
+            embed.add_field(name="👥 Jogadores", value=jogadores_texto, inline=False)
+            embed.add_field(name="🛡️ Mediador", value="Será definido na partida", inline=False)
+            embed.set_thumbnail(url=IMAGEM_URL)
+            await mensagem.edit(embed=embed, view=FilaView(nome))
+    except Exception as e:
+        print(f"Aviso: não consegui atualizar painel da fila {nome}: {e}")
+
 
 # =========================
 # COMANDOS
@@ -1364,8 +1433,15 @@ async def criar_fila_streamer(
     embed.add_field(name="👥 Jogadores", value="Nenhum aguardando.", inline=False)
     embed.set_thumbnail(url=streamer.display_avatar.url)
 
+    mensagem_fila = await interaction.channel.send(embed=embed, view=FilaStreamerView(nome_fila))
+
+    dados = carregar()
+    if nome_fila in dados.get("filas", {}):
+        dados["filas"][nome_fila]["painel_channel_id"] = mensagem_fila.channel.id
+        dados["filas"][nome_fila]["painel_message_id"] = mensagem_fila.id
+        salvar(dados)
+
     await interaction.followup.send("Fila streamer criada com sucesso.", ephemeral=True)
-    await interaction.channel.send(embed=embed, view=FilaStreamerView(nome_fila))
 
 
 @criar_fila_streamer.error
@@ -1417,8 +1493,15 @@ async def criar_fila(interaction: discord.Interaction, nome: str, valor: float, 
     embed.add_field(name="🛡️ Mediador", value="Será definido na partida", inline=False)
     embed.set_thumbnail(url=IMAGEM_URL)
 
+    mensagem_fila = await interaction.channel.send(embed=embed, view=FilaView(nome_completo))
+
+    dados = carregar()
+    if nome_completo in dados.get("filas", {}):
+        dados["filas"][nome_completo]["painel_channel_id"] = mensagem_fila.channel.id
+        dados["filas"][nome_completo]["painel_message_id"] = mensagem_fila.id
+        salvar(dados)
+
     await interaction.followup.send("Fila criada com sucesso.", ephemeral=True)
-    await interaction.channel.send(embed=embed, view=FilaView(nome_completo))
 
 
 @criar_fila.error
@@ -1509,20 +1592,26 @@ async def encerrar_fila(interaction: discord.Interaction, nome: str = None):
         # Se tem jogadores específicos, remove só eles.
         # Se não tem, limpa a fila inteira.
         if jogadores_para_remover:
+            remover_set = {str(uid) for uid in jogadores_para_remover}
+
             fila["jogadores"] = [
                 uid for uid in fila.get("jogadores", [])
-                if uid not in jogadores_para_remover
+                if str(uid) not in remover_set
             ]
 
             if "modo" in fila:
-                for uid in jogadores_para_remover:
+                for uid in remover_set:
                     fila["modo"].pop(str(uid), None)
 
             if "salas_criadas" in fila:
                 fila["salas_criadas"] = [
                     uid for uid in fila.get("salas_criadas", [])
-                    if uid not in jogadores_para_remover
+                    if str(uid) not in remover_set
                 ]
+
+            dados.setdefault("fila_tempo", {}).setdefault(nome_escolhido, {})
+            for uid in remover_set:
+                dados["fila_tempo"].get(nome_escolhido, {}).pop(str(uid), None)
         else:
             fila["jogadores"] = []
             fila["modo"] = {}
@@ -1530,6 +1619,11 @@ async def encerrar_fila(interaction: discord.Interaction, nome: str = None):
 
         fila["em_partida"] = False
         salvar(dados)
+
+        try:
+            await atualizar_painel_fila_salvo(interaction.guild, nome_escolhido)
+        except Exception as e:
+            print(f"Aviso: painel da fila não atualizou no /encerrar_fila: {e}")
 
     canais_para_deletar = []
 
