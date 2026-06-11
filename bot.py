@@ -211,6 +211,11 @@ def registrar_views_persistentes():
     except Exception:
         pass
 
+    try:
+        bot.add_view(ConfirmacaoView([]))
+    except Exception as e:
+        print(f"Aviso: não foi possível registrar ConfirmacaoView persistente: {e}")
+
     print(f"Views persistentes registradas: {total}")
 
 # =========================
@@ -999,54 +1004,155 @@ async def criar_sala_privada(guild, membros, nome_fila, emuladores):
 
 
 class ConfirmacaoView(discord.ui.View):
-    def __init__(self, jogadores_ids):
-        super().__init__(timeout=300)
-        self.jogadores_ids = jogadores_ids
+    def __init__(self, jogadores_ids=None):
+        # timeout=None impede o Discord de matar os botões depois de alguns minutos.
+        # custom_id fixo nos botões permite registrar a View após reiniciar o bot.
+        super().__init__(timeout=None)
+        self.jogadores_ids = [int(x) for x in (jogadores_ids or []) if str(x).isdigit()]
         self.confirmados = set()
 
-    @discord.ui.button(label="Confirmar Resultado", style=discord.ButtonStyle.green)
+    def _dados_canal_partida(self, channel):
+        """Lê o tópico do canal privado.
+        Formatos aceitos:
+        FILA:nome
+        FILA:nome|PLAYERS:id1,id2
+        FILA:nome|PLAYERS:id1,id2|CONFIRMADOS:id1
+        """
+        topico = (getattr(channel, "topic", "") or "").strip()
+        nome_fila = None
+        jogadores = []
+        confirmados = set()
+
+        if topico.startswith("FILA:"):
+            resto = topico.replace("FILA:", "", 1).strip()
+            partes = resto.split("|")
+            nome_fila = partes[0].strip()
+
+            for parte in partes[1:]:
+                if parte.startswith("PLAYERS:"):
+                    ids_txt = parte.replace("PLAYERS:", "", 1)
+                    for item in ids_txt.split(","):
+                        item = item.strip()
+                        if item.isdigit():
+                            jogadores.append(int(item))
+                elif parte.startswith("CONFIRMADOS:"):
+                    ids_txt = parte.replace("CONFIRMADOS:", "", 1)
+                    for item in ids_txt.split(","):
+                        item = item.strip()
+                        if item.isdigit():
+                            confirmados.add(int(item))
+
+        if not jogadores and self.jogadores_ids:
+            jogadores = list(self.jogadores_ids)
+
+        return nome_fila, jogadores, confirmados
+
+    async def _salvar_confirmados_no_topico(self, channel, nome_fila, jogadores, confirmados):
+        try:
+            if not nome_fila:
+                return
+            players_txt = ",".join(str(x) for x in jogadores)
+            confirmados_txt = ",".join(str(x) for x in sorted(confirmados))
+            novo_topico = f"FILA:{nome_fila}|PLAYERS:{players_txt}|CONFIRMADOS:{confirmados_txt}"
+            await channel.edit(topic=novo_topico[:1024])
+        except Exception as e:
+            print(f"Aviso: não consegui salvar confirmações no tópico: {e}")
+
+    async def _limpar_fila_da_partida(self, guild, channel):
+        nome_fila, jogadores, _ = self._dados_canal_partida(channel)
+        if not nome_fila:
+            return
+
+        dados = carregar()
+        filas = dados.get("filas", {})
+        if nome_fila not in filas:
+            return
+
+        fila = garantir_fila_salva(dados, nome_fila)
+        remover_set = {str(uid) for uid in jogadores}
+
+        if remover_set:
+            fila["jogadores"] = [uid for uid in fila.get("jogadores", []) if str(uid) not in remover_set]
+            for uid in remover_set:
+                fila.setdefault("modo", {}).pop(str(uid), None)
+                dados.setdefault("fila_tempo", {}).setdefault(nome_fila, {}).pop(str(uid), None)
+            if "salas_criadas" in fila:
+                fila["salas_criadas"] = [uid for uid in fila.get("salas_criadas", []) if str(uid) not in remover_set]
+        else:
+            fila["jogadores"] = []
+            fila["modo"] = {}
+            fila["salas_criadas"] = []
+
+        fila["em_partida"] = False
+        salvar(dados)
+
+        try:
+            await atualizar_painel_fila_salvo(guild, nome_fila)
+        except Exception as e:
+            print(f"Aviso: painel não atualizou ao limpar partida: {e}")
+
+    def _usuario_pode_mexer(self, interaction, jogadores):
+        if is_mediador(interaction) or is_admin(interaction):
+            return True
+        if jogadores:
+            return interaction.user.id in jogadores
+        return True
+
+    @discord.ui.button(label="Confirmar Resultado", style=discord.ButtonStyle.green, custom_id="partida:confirmar_resultado")
     async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id not in self.jogadores_ids:
-            await interaction.response.send_message(
-                "Você não participa dessa partida.",
-                ephemeral=True
-            )
+        await interaction.response.defer(ephemeral=False, thinking=False)
+
+        nome_fila, jogadores, confirmados = self._dados_canal_partida(interaction.channel)
+
+        if not self._usuario_pode_mexer(interaction, jogadores):
+            await interaction.followup.send("Você não participa dessa partida.", ephemeral=True)
             return
 
-        if interaction.user.id in self.confirmados:
-            await interaction.response.send_message(
-                "Você já confirmou!",
-                ephemeral=True
-            )
+        if interaction.user.id in confirmados or interaction.user.id in self.confirmados:
+            await interaction.followup.send("Você já confirmou!", ephemeral=True)
             return
 
+        confirmados.add(interaction.user.id)
         self.confirmados.add(interaction.user.id)
-        await interaction.response.send_message(
-            f"✅ {interaction.user.mention} confirmou a aposta!"
-        )
+        await self._salvar_confirmados_no_topico(interaction.channel, nome_fila, jogadores, confirmados)
 
-        if len(self.confirmados) == 2:
+        await interaction.followup.send(f"✅ {interaction.user.mention} confirmou a aposta!")
+
+        # Se tiver 2 jogadores salvos no tópico, espera os 2 confirmarem.
+        # Se não tiver, usa 2 confirmações como padrão.
+        necessario = len(jogadores) if len(jogadores) >= 2 else 2
+        total_confirmados = len(confirmados.union(self.confirmados))
+
+        if total_confirmados >= necessario:
             await self.criar_sala_mediador(interaction)
 
-    @discord.ui.button(label="Cancelar Partida", style=discord.ButtonStyle.red)
+    @discord.ui.button(label="Cancelar Partida", style=discord.ButtonStyle.red, custom_id="partida:cancelar_partida")
     async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id not in self.jogadores_ids:
-            await interaction.response.send_message(
-                "Você não participa dessa partida.",
-                ephemeral=True
-            )
+        await interaction.response.defer(ephemeral=False, thinking=False)
+
+        nome_fila, jogadores, _ = self._dados_canal_partida(interaction.channel)
+
+        if not self._usuario_pode_mexer(interaction, jogadores):
+            await interaction.followup.send("Você não participa dessa partida.", ephemeral=True)
             return
 
-        await interaction.response.send_message(
-            "❌ Partida cancelada. Fechando sala..."
-        )
+        await self._limpar_fila_da_partida(interaction.guild, interaction.channel)
+        await interaction.followup.send("❌ Partida cancelada. Fechando sala...")
 
         await asyncio.sleep(2)
-        await interaction.channel.delete()
+        try:
+            await interaction.channel.delete(reason=f"Partida cancelada por {interaction.user}")
+        except Exception as e:
+            print(f"Erro ao deletar canal da partida cancelada: {e}")
 
     async def criar_sala_mediador(self, interaction: discord.Interaction):
         canal = interaction.channel
-        await canal.purge(limit=100)
+        await self._limpar_fila_da_partida(interaction.guild, canal)
+
+        try:
+            await canal.purge(limit=100)
+        except Exception as e:
+            print(f"Aviso: não consegui limpar mensagens da sala: {e}")
 
         mensagem = """
 Seja bem-vindo a nossa organização de Free Fire.  
@@ -1067,6 +1173,7 @@ Abra um ticket.
         embed.set_image(url=IMAGEM_URL)
 
         await canal.send(content=mensagem, embed=embed)
+
 
 
 # =========================
